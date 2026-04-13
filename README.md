@@ -6,67 +6,103 @@ A Databricks App that scans Unity Catalog metadata across all accessible catalog
 
 | Feature | Description |
 |---|---|
-| **Multi-Catalog Scanner** | Scans every accessible catalog in one click — schemas, tables, columns, types, row counts, comments, timestamps. Shows which catalogs were scanned with per-catalog breakdowns. |
-| **Permissions Viewer** | Shows which groups and users have READ / WRITE access to each table via `system.information_schema` — no `MANAGE` privilege needed. |
-| **Duplicate Detection** | Clusters tables that represent the same entity using column-name Jaccard similarity, type compatibility, and fuzzy table-name matching. Groups are labelled by the common entity name (e.g. "Students", "Exam Results") rather than generic IDs. |
-| **Gold Standard Scoring** | Ranks each duplicate on completeness, documentation, naming convention, schema tier, freshness, and row count to recommend the canonical dataset. |
+| **Multi-Catalog Scanner** | Background scan of every accessible catalog with live progress polling — schemas, tables, columns, types, comments, timestamps, and permissions. Per-catalog breakdowns shown on the dashboard. |
+| **Result Caching** | Scan results and duplicate groups are cached in `catalog_40_copper_uc_metadata.cache`. On startup the app loads from cache instantly; a fresh scan is triggered automatically if the cache is older than 7 days or the cache schema version has changed. |
+| **Permissions Viewer** | Shows which groups and users have READ / WRITE access to each table via metadata snapshot tables — no `MANAGE` privilege needed. Permissions are merged across catalog, schema, and table grant levels. |
+| **Duplicate Detection** | Clusters tables that represent the same entity using column-name Jaccard similarity, type compatibility, and fuzzy table-name matching. Uses a normalised-name grouping pre-filter for scalable comparison (~100K candidates from 143K tables). Groups are labelled by common entity name. |
+| **Gold Standard Scoring** | Ranks each table in a duplicate group on column completeness and freshness to recommend the canonical dataset. |
 | **Table Comparison** | Side-by-side column diff, permissions diff, and sample data for any two tables. |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Databricks App                        │
-│                                                          │
-│  ┌──────────────┐       ┌──────────────────────────────┐ │
-│  │   Frontend    │       │     FastAPI Backend           │ │
-│  │  (Vanilla JS) │◄────►│                              │ │
-│  │              │       │  /api/catalog/list            │ │
-│  │  Dashboard   │       │  /api/catalog/scan-all         │ │
-│  │  Catalog     │       │  /api/duplicates/*            │ │
-│  │  Duplicates  │       │  /api/compare/*               │ │
-│  │  Compare     │       │                              │ │
-│  └──────────────┘       │  scanner.py  (UC SDK + SQL)  │ │
-│                         │  duplicates.py               │ │
-│                         │  comparator.py               │ │
-│                         └────────┬─────────────────────┘ │
-└──────────────────────────────────┼───────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                      Databricks App                          │
+│                                                              │
+│  ┌──────────────┐       ┌──────────────────────────────────┐ │
+│  │   Frontend    │       │       FastAPI Backend             │ │
+│  │  (Vanilla JS) │◄────►│                                  │ │
+│  │              │       │  /api/catalog/*   (scan, cache)   │ │
+│  │  Dashboard   │       │  /api/duplicates/* (groups)       │ │
+│  │  Catalog     │       │  /api/compare/*   (diff, sample)  │ │
+│  │  Duplicates  │       │                                  │ │
+│  │  Compare     │       │  scanner.py   (SQL Statement API) │ │
+│  └──────────────┘       │  cache.py     (UC cache layer)   │ │
+│                         │  duplicates.py (detection engine) │ │
+│                         │  comparator.py (table diff)      │ │
+│                         └────────┬─────────────────────────┘ │
+└──────────────────────────────────┼───────────────────────────┘
                                    │
                     ┌──────────────▼──────────────────┐
-                    │        Databricks APIs           │
-                    │                                  │
-                    │  Unity Catalog SDK  (metadata)   │
-                    │  SQL Statement API  (queries)    │
-                    │  system.information_schema       │
-                    │    (permissions — no MANAGE)     │
-                    └──────────────────────────────────┘
+                    │       Unity Catalog               │
+                    │                                   │
+                    │  catalog_40_copper_uc_metadata     │
+                    │   ├── metadata.*  (weekly CTAS     │
+                    │   │   snapshots of                 │
+                    │   │   system.information_schema)   │
+                    │   └── cache.*    (scan results     │
+                    │       + duplicate groups)          │
+                    │                                   │
+                    │  SQL Statement API                 │
+                    │   (EXTERNAL_LINKS disposition)     │
+                    └───────────────────────────────────┘
 ```
 
 ## Project structure
 
 ```
-uc-data-quality-duplicates/
-├── databricks.yml          # DAB bundle config (targets, variables)
-├── app.yaml                # App runtime config (command, env vars)
-├── app.py                  # FastAPI entrypoint
-├── requirements.txt        # Python dependencies
+uc-duplicate-data-detector/
+├── databricks.yml              # DAB bundle config (targets, variables)
+├── app.yaml                    # App runtime config (command, env vars)
+├── app.py                      # FastAPI entrypoint
+├── requirements.txt            # Python dependencies
 ├── server/
-│   ├── config.py           # Dual-mode auth (local CLI / deployed App)
-│   ├── scanner.py          # UC metadata scanner + permissions (via SQL)
-│   ├── duplicates.py       # Duplicate detection + gold standard scoring
-│   ├── comparator.py       # Table comparison + sample data
+│   ├── config.py               # Dual-mode auth (local CLI / deployed App)
+│   ├── scanner.py              # UC metadata scanner + permissions (via SQL)
+│   ├── cache.py                # Cache manager (read/write scan results to UC)
+│   ├── duplicates.py           # Duplicate detection + gold standard scoring
+│   ├── comparator.py           # Table comparison + sample data
 │   └── routes/
-│       ├── catalog.py      # /api/catalog/*  (list, scan-all, schemas, tables)
-│       ├── duplicates.py   # /api/duplicates/*
-│       └── compare.py      # /api/compare/*
+│       ├── catalog.py          # /api/catalog/*  (list, scan, cache, schemas, tables)
+│       ├── duplicates.py       # /api/duplicates/*
+│       └── compare.py          # /api/compare/*
 ├── frontend/
-│   └── dist/               # Static SPA (HTML/CSS/JS, no build step)
+│   └── dist/                   # Static SPA (HTML/CSS/JS, no build step)
 └── scripts/
-    ├── deploy.sh                  # One-command deploy (bundle + app source)
-    ├── create_governance_views.sql # MVs for permissions (run once per catalog)
-    ├── generate_data.py           # Test data generator (Python + CLI)
-    └── generate_data.sql          # Test data generator (pure SQL)
+    ├── deploy.sh                      # One-command deploy (bundle + app source)
+    ├── create_governance_tables.sql   # CTAS snapshots of system.information_schema (run weekly)
+    ├── generate_data.py               # Test data generator (Python + CLI)
+    └── generate_data.sql              # Test data generator (pure SQL)
 ```
+
+## How it works
+
+### Metadata source
+
+All metadata is read from **snapshot tables** in `catalog_40_copper_uc_metadata.metadata` — weekly CTAS copies of `system.information_schema` tables (catalogs, schemata, tables, columns, catalog_privileges, schema_privileges, table_privileges). These snapshots provide definer-rights access so the app's service principal can read metadata across all catalogs without `MANAGE` privileges.
+
+### Scan flow
+
+1. **POST /api/catalog/scan-all** launches a background thread that queries each catalog sequentially (schemas, tables, columns, and three privilege levels).
+2. The frontend polls **GET /api/catalog/scan-status** every 2 seconds with progress updates ("Scanning catalog_name (3/7)…").
+3. After the scan, **duplicate detection** runs in the same background thread using a normalised-name pre-filter and composite similarity scoring.
+4. Results are written to the **UC cache** (`catalog_40_copper_uc_metadata.cache`) so the next app restart loads instantly.
+5. The SQL Statement API uses `EXTERNAL_LINKS` disposition to handle result sets exceeding the 25 MB inline limit.
+
+### Cache layer
+
+Scan results and duplicate groups are persisted in two Delta tables:
+
+| Table | Contents |
+|---|---|
+| `cache.cache_metadata` | Single row: cache version, timestamp, serialised scan-result JSON |
+| `cache.duplicate_groups` | One row per group: label, tables, pairs, gold standard, scores (complex fields as JSON) |
+
+**Invalidation triggers:**
+- Cache older than 7 days (matching the weekly metadata refresh cadence)
+- `CACHE_VERSION` constant in `cache.py` differs from the stored version (covers schema changes during development)
+
+On startup the frontend calls `GET /api/catalog/cache-status`. If valid, `POST /api/catalog/cache-load` bulk-loads tables and schemas from the metadata snapshot (2 queries total, vs 6 × N catalogs for a full scan) and restores duplicate groups from cache. Table columns and permissions are loaded lazily on demand when viewing individual table details.
 
 ## Prerequisites
 
@@ -75,61 +111,40 @@ uc-data-quality-duplicates/
 - A Databricks workspace with:
   - Unity Catalog enabled
   - A SQL warehouse (Serverless or Pro)
-  - System tables enabled (for permissions via `system.information_schema`)
+  - The `catalog_40_copper_uc_metadata` catalog with a `metadata` schema (weekly CTAS snapshots)
   - Permission to create Apps
 
 ## Permissions
 
-The app's service principal needs **no `MANAGE` privilege**. Permissions are read via `system.information_schema` SQL views instead of the UC Permissions REST API.
+The app's service principal needs **no `MANAGE` privilege**. Permissions are read from weekly CTAS snapshot tables in `catalog_40_copper_uc_metadata.metadata` — mirrors of `system.information_schema` that provide definer-rights access.
 
 ### Required grants for the service principal
 
 | Privilege | Scope | Purpose |
 |---|---|---|
-| `USE CATALOG` | Each catalog to scan | List schemas and tables |
-| `USE SCHEMA` | Each schema to scan | List tables within schemas |
-| `SELECT` | Each schema to scan | Row counts and sample data queries |
-| `USE SCHEMA` | `<catalog>.governance` | Access governance materialized views |
-| `SELECT` | `<catalog>.governance` | Read permissions (catalog/schema/table grants) |
+| `USE CATALOG` | `catalog_40_copper_uc_metadata` | Access the app catalog |
+| `USE SCHEMA` | `catalog_40_copper_uc_metadata.metadata` | Read metadata snapshots |
+| `SELECT` | `catalog_40_copper_uc_metadata.metadata` | Query schemas, tables, columns, privileges |
+| `CREATE SCHEMA` | `catalog_40_copper_uc_metadata` | Create the `cache` schema on first scan |
 | `CAN_USE` | SQL warehouse | Execute SQL queries |
 
 ### Quick setup
 
-**Step 1 — Create governance materialized views** (run once per catalog):
+**Step 1 — Create metadata snapshot tables** (schedule weekly):
 
-Open `scripts/create_governance_views.sql` in a Databricks SQL editor, set the widget to your catalog name, and run all statements. This creates MVs in `<catalog>.governance` that mirror `system.information_schema` privilege tables using **definer rights** — so the SP can read permissions without needing access to the `system` catalog.
+Open `scripts/create_governance_tables.sql` in a Databricks SQL editor and run all statements. This creates CTAS snapshot tables in `catalog_40_copper_uc_metadata.metadata` that mirror `system.information_schema` views. The executing user becomes the schema owner (definer) — their privileges determine what metadata is visible at refresh time.
 
-> Any user with `SELECT` on `system.information_schema` can create these MVs (typically all workspace users).
-
-**Step 2 — Grant the SP access** (per catalog):
+**Step 2 — Grant the SP access** (replace `<SP_ID>`):
 
 ```sql
--- Catalog + schema access
-GRANT USE CATALOG ON CATALOG <CATALOG> TO `<SP_ID>`;
-GRANT USE SCHEMA ON SCHEMA <CATALOG>.<schema> TO `<SP_ID>`;  -- repeat per schema
-GRANT SELECT ON SCHEMA <CATALOG>.<schema> TO `<SP_ID>`;      -- repeat per schema
+-- Metadata snapshot access
+GRANT USE CATALOG ON CATALOG catalog_40_copper_uc_metadata TO `<SP_ID>`;
+GRANT USE SCHEMA ON SCHEMA catalog_40_copper_uc_metadata.metadata TO `<SP_ID>`;
+GRANT SELECT ON SCHEMA catalog_40_copper_uc_metadata.metadata TO `<SP_ID>`;
 
--- Governance MVs (permissions viewer)
-GRANT USE SCHEMA ON SCHEMA <CATALOG>.governance TO `<SP_ID>`;
-GRANT SELECT ON SCHEMA <CATALOG>.governance TO `<SP_ID>`;
+-- Cache schema (created automatically, but SP needs permission to create it)
+GRANT CREATE SCHEMA ON CATALOG catalog_40_copper_uc_metadata TO `<SP_ID>`;
 ```
-
-### How permissions reading works
-
-The app tries three sources in order:
-1. `<catalog>.governance.*_privileges` — materialized views (recommended, no MANAGE needed)
-2. `system.information_schema.*_privileges` — direct system tables (requires metastore admin to grant)
-3. Degrades gracefully — shows "No grants found" if neither source is accessible
-
-### Alternative: BROWSE privilege
-
-For read-only metadata access across all current and future catalogs:
-
-```sql
-GRANT BROWSE ON METASTORE TO `<SP_ID>`;
-```
-
-`BROWSE` covers metadata listing. You still need per-catalog `SELECT` for row counts and sample data.
 
 ## Getting started
 
@@ -230,17 +245,16 @@ print(d['service_principal_client_id'])
 "
 ```
 
-Then grant access (replace `<SP_ID>` and `<CATALOG>`):
+Then grant access (replace `<SP_ID>`):
 
 ```sql
--- Access to catalogs you want to scan (repeat per schema)
-GRANT USE CATALOG ON CATALOG <CATALOG> TO `<SP_ID>`;
-GRANT USE SCHEMA ON SCHEMA <CATALOG>.<schema> TO `<SP_ID>`;
-GRANT SELECT ON SCHEMA <CATALOG>.<schema> TO `<SP_ID>`;
+-- Metadata snapshots
+GRANT USE CATALOG ON CATALOG catalog_40_copper_uc_metadata TO `<SP_ID>`;
+GRANT USE SCHEMA ON SCHEMA catalog_40_copper_uc_metadata.metadata TO `<SP_ID>`;
+GRANT SELECT ON SCHEMA catalog_40_copper_uc_metadata.metadata TO `<SP_ID>`;
 
--- Access to governance MVs for permissions (no MANAGE needed)
-GRANT USE SCHEMA ON SCHEMA <CATALOG>.governance TO `<SP_ID>`;
-GRANT SELECT ON SCHEMA <CATALOG>.governance TO `<SP_ID>`;
+-- Cache schema creation
+GRANT CREATE SCHEMA ON CATALOG catalog_40_copper_uc_metadata TO `<SP_ID>`;
 ```
 
 And grant `CAN_USE` on the SQL warehouse:
@@ -260,8 +274,8 @@ Open the `url` from the output in your browser. You must be logged into the work
 
 ## Using the app
 
-1. **Dashboard** — click **Scan All Catalogs** to scan every accessible catalog at once. Stat cards show total schemas, tables, and columns plus per-catalog breakdowns and detected duplicate groups.
-2. **Catalog Explorer** — browse all catalogs in a tree (catalog > schema > table), click a table to see columns, row count, owner, comments, and group permissions.
+1. **Dashboard** — on first load, the app checks for a valid cache. If found, results load instantly with a green "Loaded from cache" banner. Otherwise, click **Scan All Catalogs** to start a background scan with live progress. Stat cards show total schemas, tables, columns, duplicate groups, and per-catalog breakdowns.
+2. **Catalog Explorer** — browse all catalogs in a tree (catalog > schema > table). Click a table to see columns, owner, comments, and merged permissions (loaded on demand).
 3. **Duplicates** — view duplicate clusters labelled by entity name (e.g. "Students", "Exam Results") with similarity scores and gold-standard badges. Adjust the threshold slider and re-detect. Cross-catalog duplicates are detected too.
 4. **Compare** — pick any two tables (from any catalog) for a side-by-side column diff, permissions comparison, and sample data preview.
 
@@ -270,12 +284,15 @@ Open the `url` from the output in your browser. You must be logged into the work
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/catalog/list` | List all accessible catalogs |
-| `GET` | `/api/catalog/scan-all` | Scan all catalogs (metadata + permissions + row counts) |
+| `POST` | `/api/catalog/scan-all` | Start a background scan (returns immediately) |
+| `GET` | `/api/catalog/scan-status` | Poll current scan progress |
+| `GET` | `/api/catalog/cache-status` | Check whether a valid cache exists |
+| `POST` | `/api/catalog/cache-load` | Load scan results from cache + bulk metadata |
 | `GET` | `/api/catalog/schemas?catalog=X` | List scanned schemas (optional catalog filter) |
-| `GET` | `/api/catalog/tables?schema=gold&catalog=X` | List tables, optionally filtered by schema/catalog |
-| `GET` | `/api/catalog/table/{catalog}/{schema}/{table}` | Full metadata for one table |
-| `GET` | `/api/duplicates/detect?threshold=0.5` | Detect duplicate groups above the similarity threshold |
-| `GET` | `/api/duplicates/groups` | Return cached duplicate groups |
+| `GET` | `/api/catalog/tables?schema=gold&catalog=X` | List tables (lightweight summaries, no columns) |
+| `GET` | `/api/catalog/table/{catalog}/{schema}/{table}` | Full metadata for one table (columns + permissions loaded on demand) |
+| `GET` | `/api/duplicates/detect?threshold=0.5` | Force re-detection with a custom threshold |
+| `GET` | `/api/duplicates/groups` | Return pre-computed duplicate groups |
 | `GET` | `/api/compare/{cat1}/{s1}/{t1}/{cat2}/{s2}/{t2}` | Column + permissions diff between two tables |
 | `GET` | `/api/compare/sample/{catalog}/{schema}/{table}` | Fetch 10 sample rows from a table |
 
@@ -293,16 +310,19 @@ Edit `server/duplicates.py` — the `detect_duplicates` function accepts:
 
 Each table in a duplicate group is scored on:
 
-- Column completeness (25 pts)
-- Documentation / comments (20 pts)
-- Naming convention — `dim_` / `fact_` prefix (15 pts)
-- Schema tier — `gold` schema (20 pts)
-- Freshness (10 pts)
-- Row count (10 pts)
+- **Column completeness** (10 pts) — tables with more columns score higher
+- **Freshness** (10 pts) — recently updated tables score higher
 
 ### Synonym mappings
 
 Edit the `_SYNONYMS` dictionary in `server/duplicates.py` to add domain-specific column name mappings (e.g. `student_id` = `learner_id` = `pupil_id`). This improves duplicate detection when teams use different naming conventions.
+
+### Cache configuration
+
+Edit `server/cache.py` to change:
+
+- `CACHE_MAX_AGE_DAYS` (default 7) — how long before the cache expires
+- `CACHE_VERSION` (default "1") — bump this when changing cache table schemas to force a rebuild
 
 ## License
 

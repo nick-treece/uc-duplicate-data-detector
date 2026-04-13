@@ -6,12 +6,15 @@ let state = {
   scanned: false,
   scanning: false,
   scanResult: null,
+  scanProgress: null,
+  scanError: null,
   schemas: [],
   tables: [],
   groups: [],
   selectedTable: null,
   compareResult: null,
   threshold: 0.5,
+  cacheInfo: null,   // { cached_at, age_days } when loaded from cache
 };
 
 // ===== Router =====
@@ -32,7 +35,49 @@ function navigate() {
 }
 
 window.addEventListener('hashchange', navigate);
-window.addEventListener('load', navigate);
+window.addEventListener('load', async () => {
+  navigate();
+  await tryLoadFromCache();
+});
+
+async function tryLoadFromCache() {
+  try {
+    const status = await API.cacheStatus();
+    if (!status.valid) {
+      console.log('Cache not valid:', status.reason);
+      return;
+    }
+
+    state.scanning = true;
+    state.scanProgress = {
+      state: 'running',
+      message: 'Loading from cache\u2026',
+      catalogs_done: 0, catalogs_total: 0,
+      catalogs_scanned: [], errors: [],
+    };
+    renderDashboard();
+
+    const cached = await API.loadFromCache();
+
+    state.scanResult = cached.scan_result;
+    state.cacheInfo = {
+      cached_at: cached.cached_at,
+      age_days: cached.cache_age_days,
+    };
+
+    showPostScanLoading('Loading schemas and tables\u2026');
+    state.schemas = await API.getSchemas();
+    state.tables = await API.getTables();
+    state.groups = cached.groups || [];
+    state.scanned = true;
+  } catch (e) {
+    console.warn('Cache load failed (will require manual scan):', e);
+  } finally {
+    state.scanning = false;
+    state.scanProgress = null;
+    renderDashboard();
+  }
+}
 
 // ===== Render =====
 const $ = id => document.getElementById(id);
@@ -96,11 +141,21 @@ async function renderDashboard() {
   main().innerHTML = `
     <h2 class="page-title">Dashboard</h2>
     <p class="page-desc">Scan all accessible Unity Catalog metadata, detect duplicate datasets, and identify gold-standard tables.</p>
+    ${state.cacheInfo ? `<div class="card" style="margin-bottom:16px;padding:12px;display:flex;align-items:center;gap:8px;border-left:3px solid var(--green)">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+      <span style="font-size:13px;color:var(--text-muted)">Loaded from cache \u2014 <strong>${Math.floor(state.cacheInfo.age_days)}d ago</strong>.
+      Click \u201cScan All Catalogs\u201d to force a fresh scan.</span>
+    </div>` : ''}
     <div style="margin-bottom:20px">
       <button class="btn btn-primary" id="scan-btn" ${state.scanning ? 'disabled' : ''}>
-        ${state.scanning ? '<div class="spinner" style="width:14px;height:14px;margin-right:6px"></div> Scanning all catalogs\u2026' : 'Scan All Catalogs'}
+        ${state.scanning ? '<div class="spinner" style="width:14px;height:14px;margin-right:6px"></div> Scanning\u2026' : 'Scan All Catalogs'}
       </button>
     </div>
+    <div id="scan-progress"></div>
+    ${state.scanError ? `<div style="background:var(--red-bg, #2d1b1b);border:1px solid var(--red, #e74c3c);border-radius:6px;padding:16px;margin-bottom:16px">
+      <div style="font-weight:700;font-size:14px;color:var(--red, #e74c3c);margin-bottom:8px">Scan failed</div>
+      <pre style="font-size:12px;color:var(--text-muted);white-space:pre-wrap;word-break:break-word;margin:0">${state.scanError}</pre>
+    </div>` : ''}
     ${sr ? renderScanSummary(sr) : '<div class="stat-card"><div class="stat-label">Status</div><div class="stat-value" style="font-size:16px;color:var(--text-muted)">Click \u201cScan All Catalogs\u201d to begin</div></div>'}
     <div id="top-duplicates"></div>
   `;
@@ -113,8 +168,21 @@ function renderScanSummary(sr) {
   const t = sr.total;
   const cats = sr.catalogs_scanned || [];
   const perCat = sr.per_catalog || {};
+  const errors = sr.errors || [];
+
+  let errorsHtml = '';
+  if (errors.length) {
+    errorsHtml = `
+      <div style="background:var(--red-bg, #2d1b1b);border:1px solid var(--red, #e74c3c);border-radius:6px;padding:12px;margin-bottom:16px">
+        <div style="font-weight:600;font-size:13px;color:var(--red, #e74c3c);margin-bottom:6px">${errors.length} warning(s) during scan</div>
+        ${errors.slice(0, 10).map(e => `<div style="font-size:12px;color:var(--text-muted);margin-bottom:2px">\u2022 ${e}</div>`).join('')}
+        ${errors.length > 10 ? `<div style="font-size:12px;color:var(--text-muted)">+ ${errors.length - 10} more</div>` : ''}
+      </div>
+    `;
+  }
 
   return `
+    ${errorsHtml}
     <div class="stats-grid" id="stats-grid">
       <div class="stat-card"><div class="stat-label">Catalogs Scanned</div><div class="stat-value">${t.catalog_count}</div></div>
       <div class="stat-card"><div class="stat-label">Schemas</div><div class="stat-value">${t.schema_count}</div></div>
@@ -138,19 +206,139 @@ function renderScanSummary(sr) {
   `;
 }
 
+// ===== Scan helpers =====
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function renderProgressPanel(status) {
+  const done = status.catalogs_done || 0;
+  const total = status.catalogs_total || 0;
+  const message = status.message || 'Scanning\u2026';
+  const scanned = status.catalogs_scanned || [];
+  const errors = status.errors || [];
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+
+  let html = `
+    <div class="card" style="margin-bottom:16px;padding:16px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <div class="spinner" style="width:14px;height:14px"></div>
+        <span style="font-weight:600;font-size:14px">${message}</span>
+      </div>
+  `;
+
+  if (total > 0) {
+    html += `
+      <div style="background:var(--bg);border-radius:4px;height:8px;overflow:hidden;margin-bottom:8px">
+        <div style="background:var(--accent);height:100%;width:${pct}%;transition:width 0.3s ease"></div>
+      </div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">${done} of ${total} catalogs (${pct}%)</div>
+    `;
+  }
+
+  if (scanned.length) {
+    html += `
+      <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px">
+        ${scanned.map(c => `<span class="tag tag-green" style="font-size:11px">\u2713 ${c}</span>`).join('')}
+      </div>
+    `;
+  }
+
+  if (errors.length) {
+    html += `
+      <div style="background:var(--red-bg, #2d1b1b);border:1px solid var(--red, #e74c3c);border-radius:4px;padding:8px;margin-top:8px">
+        <div style="font-weight:600;font-size:12px;color:var(--red, #e74c3c);margin-bottom:4px">${errors.length} warning(s)</div>
+        ${errors.slice(0, 5).map(e => `<div style="font-size:11px;color:var(--text-muted);margin-bottom:2px">\u2022 ${e}</div>`).join('')}
+        ${errors.length > 5 ? `<div style="font-size:11px;color:var(--text-muted)">+ ${errors.length - 5} more</div>` : ''}
+      </div>
+    `;
+  }
+
+  html += '</div>';
+  return html;
+}
+
+function updateScanProgress(status) {
+  const el = document.getElementById('scan-progress');
+  if (!el) return;
+  el.innerHTML = renderProgressPanel(status);
+}
+
+function showPostScanLoading(message) {
+  const el = document.getElementById('scan-progress');
+  if (!el) return;
+  el.innerHTML = `
+    <div class="card" style="margin-bottom:16px;padding:16px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="spinner" style="width:14px;height:14px"></div>
+        <span style="font-weight:600;font-size:14px">${message}</span>
+      </div>
+    </div>
+  `;
+}
+
+async function pollScanUntilDone() {
+  let consecutiveErrors = 0;
+
+  while (true) {
+    await sleep(2000);
+
+    try {
+      const status = await API.scanStatus();
+      consecutiveErrors = 0;  // reset on success
+      state.scanProgress = status;
+      updateScanProgress(status);
+
+      if (status.state === 'completed') return status.result;
+      if (status.state === 'failed') {
+        const errors = status.errors || [];
+        const errorDetail = errors.length ? `\n\nDetails:\n${errors.join('\n')}` : '';
+        throw new Error((status.error || 'Scan failed') + errorDetail);
+      }
+    } catch (e) {
+      if (e.message && (e.message.includes('Scan failed') || e.message.includes('API error: 5'))) {
+        throw e;  // real server-side failure
+      }
+      consecutiveErrors++;
+      console.warn(`Poll attempt failed (${consecutiveErrors}/10): ${e.message}`);
+      if (consecutiveErrors >= 10) {
+        throw new Error('Lost connection to scan \u2014 server may still be processing');
+      }
+      // transient network/timeout error \u2014 keep polling
+    }
+  }
+}
+
 async function doScan() {
   state.scanning = true;
+  state.scanProgress = null;
+  state.scanError = null;
   renderDashboard();
+
   try {
-    state.scanResult = await API.scanAll();
+    // Start the background scan (returns immediately)
+    await API.startScan();
+
+    // Poll until the scan completes or fails
+    const scanResult = await pollScanUntilDone();
+    state.scanResult = scanResult;
+
+    // Fetch supplementary data now that the scan is done
+    showPostScanLoading('Loading schemas and tables\u2026');
     state.schemas = await API.getSchemas();
     state.tables = await API.getTables();
-    state.groups = await API.detectDuplicates(state.threshold);
+
+    showPostScanLoading('Loading duplicate groups\u2026');
+    state.groups = await API.getGroups();
     state.scanned = true;
+    state.cacheInfo = null;  // fresh scan, not from cache
   } catch (e) {
-    alert('Scan failed: ' + e.message);
+    console.error('Scan failed:', e);
+    state.scanError = e.message;
   }
+
   state.scanning = false;
+  state.scanProgress = null;
   renderDashboard();
 }
 
@@ -254,8 +442,7 @@ function renderTableDetail(info) {
 
     ${info.comment ? `<div class="card" style="margin-bottom:16px;background:var(--bg)"><p style="font-size:13px;color:var(--text-muted)">${info.comment}</p></div>` : ''}
 
-    <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px">
-      <div class="stat-card"><div class="stat-label">Rows</div><div class="stat-value" style="font-size:20px">${formatNumber(info.row_count)}</div></div>
+    <div class="stats-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:20px">
       <div class="stat-card"><div class="stat-label">Columns</div><div class="stat-value" style="font-size:20px">${info.columns.length}</div></div>
       <div class="stat-card"><div class="stat-label">Owner</div><div class="stat-value" style="font-size:14px">${info.owner || '\u2014'}</div></div>
     </div>
@@ -529,7 +716,6 @@ function renderCompareResult(r, sampleA, sampleB) {
       <div class="card">
         <h4 style="font-weight:700;margin-bottom:8px">${r.table_a.full_name}</h4>
         <div style="font-size:13px;color:var(--text-muted)">
-          <div>Rows: <strong>${formatNumber(r.table_a.row_count)}</strong></div>
           <div>Columns: <strong>${r.table_a.column_count}</strong></div>
           <div>Owner: ${r.table_a.owner || '\u2014'}</div>
           ${r.table_a.comment ? `<div style="margin-top:6px;font-style:italic">${r.table_a.comment}</div>` : ''}
@@ -538,7 +724,6 @@ function renderCompareResult(r, sampleA, sampleB) {
       <div class="card">
         <h4 style="font-weight:700;margin-bottom:8px">${r.table_b.full_name}</h4>
         <div style="font-size:13px;color:var(--text-muted)">
-          <div>Rows: <strong>${formatNumber(r.table_b.row_count)}</strong></div>
           <div>Columns: <strong>${r.table_b.column_count}</strong></div>
           <div>Owner: ${r.table_b.owner || '\u2014'}</div>
           ${r.table_b.comment ? `<div style="margin-top:6px;font-style:italic">${r.table_b.comment}</div>` : ''}

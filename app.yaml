@@ -10,4 +10,4 @@ command:
 
 env:
   - name: WAREHOUSE_ID
-    value: "<YOUR_WAREHOUSE_ID>"
+    value: "67d25ef1ca1c6dbe"

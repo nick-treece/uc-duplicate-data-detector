@@ -4,6 +4,9 @@ bundle:
 variables:
   warehouse_id:
     description: SQL warehouse ID used for row-count and sample-data queries
+  app_catalog:
+    description: Catalog for metadata snapshot tables (mirrors system.information_schema)
+    default: catalog_40_copper_uc_metadata
 
 resources:
   apps:
@@ -15,10 +18,29 @@ resources:
         group-level permissions.
       source_code_path: .
 
+  jobs:
+    refresh_metadata_tables:
+      name: Weekly Metadata Table Refresh
+      description: >
+        Refreshes metadata schema snapshot tables (CTAS) from
+        system.information_schema. Re-creates all tables with current
+        metadata visible to the job owner.
+      schedule:
+        quartz_cron_expression: "0 0 0 ? * SAT"
+        timezone_id: Europe/London
+      tasks:
+        - task_key: refresh_tables
+          sql_task:
+            file:
+              path: ./scripts/create_governance_tables.sql
+              source: WORKSPACE
+            warehouse_id: ${var.warehouse_id}
+
 targets:
   dev:
     default: true
     workspace:
-      host: https://<YOUR_WORKSPACE>.cloud.databricks.com
+      host: https://adb-5037484389568426.6.azuredatabricks.net/
     variables:
-      warehouse_id: <YOUR_WAREHOUSE_ID>
+      warehouse_id: 67d25ef1ca1c6dbe
+      app_catalog: catalog_40_copper_uc_metadata

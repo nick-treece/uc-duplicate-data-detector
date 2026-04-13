@@ -5,6 +5,12 @@ const API = {
     return resp.json();
   },
 
+  async post(path) {
+    const resp = await fetch(`/api${path}`, { method: 'POST' });
+    if (!resp.ok) throw new Error(`API error: ${resp.status}`);
+    return resp.json();
+  },
+
   _qs(params) {
     const p = Object.entries(params).filter(([, v]) => v != null && v !== '');
     return p.length ? '?' + p.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&') : '';
@@ -12,7 +18,17 @@ const API = {
 
   listCatalogs() { return this.get('/catalog/list'); },
 
-  scanAll() { return this.get('/catalog/scan-all'); },
+  /** Start a background scan. Returns immediately with status. */
+  startScan() { return this.post('/catalog/scan-all'); },
+
+  /** Poll the current scan progress. */
+  scanStatus() { return this.get('/catalog/scan-status'); },
+
+  /** Check whether a valid cache exists. */
+  cacheStatus() { return this.get('/catalog/cache-status'); },
+
+  /** Load scan results from cache (bulk metadata + cached groups). */
+  loadFromCache() { return this.post('/catalog/cache-load'); },
 
   getSchemas(catalog) {
     return this.get('/catalog/schemas' + this._qs({ catalog }));
