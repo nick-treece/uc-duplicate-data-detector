@@ -11,7 +11,7 @@ A Databricks App that scans Unity Catalog metadata across all accessible catalog
 | **Permissions Viewer** | Shows which groups and users have READ / WRITE access to each table via metadata snapshot tables — no `MANAGE` privilege needed. Permissions are merged across catalog, schema, and table grant levels. |
 | **Duplicate Detection** | Clusters tables that represent the same entity using column-name Jaccard similarity, type compatibility, and fuzzy table-name matching. Uses a normalised-name grouping pre-filter for scalable comparison (~100K candidates from 143K tables). Groups are labelled by common entity name. |
 | **Gold Standard Scoring** | Ranks each table in a duplicate group on column completeness and freshness to recommend the canonical dataset. |
-| **Table Comparison** | Side-by-side column diff, permissions diff, and sample data for any two tables. |
+| **Table Comparison** | Side-by-side column diff and permissions diff for any two tables. |
 
 ## Architecture
 
@@ -71,6 +71,7 @@ uc-duplicate-data-detector/
 └── scripts/
     ├── deploy.sh                      # One-command deploy (bundle + app source)
     ├── create_governance_tables.sql   # CTAS snapshots of system.information_schema (run weekly)
+    ├── ingest_group_membership        # Notebook: fetches SCIM group memberships into UC
     ├── generate_data.py               # Test data generator (Python + CLI)
     └── generate_data.sql              # Test data generator (pure SQL)
 ```
@@ -91,18 +92,31 @@ All metadata is read from **snapshot tables** in `catalog_40_copper_uc_metadata.
 
 ### Cache layer
 
-Scan results and duplicate groups are persisted in two Delta tables:
+Scan results and duplicate groups are persisted in two Delta tables with append-based versioning (`scan_id`):
 
 | Table | Contents |
 |---|---|
-| `cache.cache_metadata` | Single row: cache version, timestamp, serialised scan-result JSON |
-| `cache.duplicate_groups` | One row per group: label, tables, pairs, gold standard, scores (complex fields as JSON) |
+| `cache.cache_metadata` | One row per scan: scan_id, cache version, timestamp, serialised scan-result JSON |
+| `cache.duplicate_groups` | One row per group per scan: scan_id, label, tables, pairs, gold standard, scores, tags (complex fields as JSON) |
+
+Each new scan appends a new `scan_id` — previous scans are retained as auditable history. The app always loads from the latest `scan_id`.
 
 **Invalidation triggers:**
 - Cache older than 7 days (matching the weekly metadata refresh cadence)
 - `CACHE_VERSION` constant in `cache.py` differs from the stored version (covers schema changes during development)
 
 On startup the frontend calls `GET /api/catalog/cache-status`. If valid, `POST /api/catalog/cache-load` bulk-loads tables and schemas from the metadata snapshot (2 queries total, vs 6 × N catalogs for a full scan) and restores duplicate groups from cache. Table columns and permissions are loaded lazily on demand when viewing individual table details.
+
+### Duplicate group filtering
+
+Groups are automatically tagged during detection:
+
+| Tag | Condition | Default |
+|---|---|---|
+| `governance_view` | 2-table group where one is a VIEW with columns that are a subset of the paired TABLE | Hidden |
+| `pipeline_stage` | All tables in the group are in medallion catalogs (gold/silver/bronze) spanning 2+ tiers | Hidden |
+
+Frontend filters (Duplicates page): two checkboxes for tag-based hiding + a free-text catalog prefix filter. Pagination limits rendering to 50 groups at a time.
 
 ## Prerequisites
 
@@ -276,8 +290,8 @@ Open the `url` from the output in your browser. You must be logged into the work
 
 1. **Dashboard** — on first load, the app checks for a valid cache. If found, results load instantly with a green "Loaded from cache" banner. Otherwise, click **Scan All Catalogs** to start a background scan with live progress. Stat cards show total schemas, tables, columns, duplicate groups, and per-catalog breakdowns.
 2. **Catalog Explorer** — browse all catalogs in a tree (catalog > schema > table). Click a table to see columns, owner, comments, and merged permissions (loaded on demand).
-3. **Duplicates** — view duplicate clusters labelled by entity name (e.g. "Students", "Exam Results") with similarity scores and gold-standard badges. Adjust the threshold slider and re-detect. Cross-catalog duplicates are detected too.
-4. **Compare** — pick any two tables (from any catalog) for a side-by-side column diff, permissions comparison, and sample data preview.
+3. **Duplicates** — view duplicate clusters labelled by entity name (e.g. "Students", "Exam Results") with similarity scores and gold-standard badges. Adjust the threshold slider and re-detect. Filter by catalog prefix, hide governance views and medallion pipeline stages. Cross-catalog duplicates are detected too.
+4. **Compare** — pick any two tables (from any catalog) for a side-by-side column diff and permissions comparison.
 
 ## API reference
 
@@ -291,10 +305,10 @@ Open the `url` from the output in your browser. You must be logged into the work
 | `GET` | `/api/catalog/schemas?catalog=X` | List scanned schemas (optional catalog filter) |
 | `GET` | `/api/catalog/tables?schema=gold&catalog=X` | List tables (lightweight summaries, no columns) |
 | `GET` | `/api/catalog/table/{catalog}/{schema}/{table}` | Full metadata for one table (columns + permissions loaded on demand) |
-| `GET` | `/api/duplicates/detect?threshold=0.5` | Force re-detection with a custom threshold |
+| `POST` | `/api/duplicates/detect?threshold=0.5` | Start background re-detection with a custom threshold |
+| `GET` | `/api/duplicates/detect-status` | Poll detection progress |
 | `GET` | `/api/duplicates/groups` | Return pre-computed duplicate groups |
 | `GET` | `/api/compare/{cat1}/{s1}/{t1}/{cat2}/{s2}/{t2}` | Column + permissions diff between two tables |
-| `GET` | `/api/compare/sample/{catalog}/{schema}/{table}` | Fetch 10 sample rows from a table |
 
 ## Customisation
 
@@ -322,7 +336,31 @@ Edit the `_SYNONYMS` dictionary in `server/duplicates.py` to add domain-specific
 Edit `server/cache.py` to change:
 
 - `CACHE_MAX_AGE_DAYS` (default 7) — how long before the cache expires
-- `CACHE_VERSION` (default "1") — bump this when changing cache table schemas to force a rebuild
+- `CACHE_VERSION` (default "3") — bump this when changing cache table schemas to force a rebuild
+
+## TODOs
+
+- [ ] **Productionise group membership ingestion** — The `scripts/ingest_group_membership` notebook fetches user and group membership data from the workspace SCIM API into `catalog_40_copper_uc_metadata.metadata.group_membership`. It currently runs under interactive user credentials requiring Workspace Admin privileges.
+
+  **Target setup:**
+  1. Create a **dedicated service principal** solely for this purpose (not the app's SP)
+  2. Grant it **Workspace Admin** role — this is the minimum role that can list all users and all group members via the SCIM API. There is no read-only SCIM permission available in Databricks; Workspace Admin is the floor.
+  3. Schedule as a **weekly job** alongside the metadata CTAS refresh
+  4. The app reads from the `group_membership` table at scan time — no admin privilege needed at app runtime
+
+  **Permission model context (Databricks SCIM API):**
+
+  | Role | List users | List group members | Can modify |
+  |---|---|---|---|
+  | Account admin | Yes | Yes | Everything |
+  | Workspace admin | Yes | Yes | Add/remove users from workspace, manage workspace-local groups |
+  | Group manager (Preview) | No | Only managed groups | Membership of managed groups only |
+  | Regular user | No | No | No |
+
+  **Mitigations:**
+  - Dedicated SP limits blast radius (no other use)
+  - Workspace admin cannot modify account-level groups, delete users from the account, access other workspaces, or change Unity Catalog permissions
+  - Running as a scheduled job (not app runtime) means the admin credential is never exposed to the app or its users
 
 ## License
 
