@@ -15,6 +15,14 @@ let state = {
   compareResult: null,
   threshold: 0.5,
   cacheInfo: null,   // { cached_at, age_days } when loaded from cache
+  filters: {
+    hideGovernanceViews: true,
+    hidePipelineStages: true,
+    catalogPrefix: '',
+  },
+  groupsPageSize: 50,
+  groupsShown: 50,
+  cacheLoading: true,   // true during initial cache check on startup
 };
 
 // ===== Router =====
@@ -42,19 +50,16 @@ window.addEventListener('load', async () => {
 
 async function tryLoadFromCache() {
   try {
+    state.cacheLoading = true;
+    renderDashboard();
+
     const status = await API.cacheStatus();
     if (!status.valid) {
       console.log('Cache not valid:', status.reason);
       return;
     }
 
-    state.scanning = true;
-    state.scanProgress = {
-      state: 'running',
-      message: 'Loading from cache\u2026',
-      catalogs_done: 0, catalogs_total: 0,
-      catalogs_scanned: [], errors: [],
-    };
+    state.scanProgress = { message: 'Cache found \u2014 loading scan results\u2026' };
     renderDashboard();
 
     const cached = await API.loadFromCache();
@@ -65,9 +70,16 @@ async function tryLoadFromCache() {
       age_days: cached.cache_age_days,
     };
 
-    showPostScanLoading('Loading schemas and tables\u2026');
+    state.scanProgress = { message: 'Loading schemas\u2026' };
+    renderDashboard();
     state.schemas = await API.getSchemas();
+
+    state.scanProgress = { message: 'Loading tables\u2026' };
+    renderDashboard();
     state.tables = await API.getTables();
+
+    state.scanProgress = { message: 'Loading duplicate groups\u2026' };
+    renderDashboard();
     state.groups = cached.groups || [];
     state.scanned = true;
   } catch (e) {
@@ -75,6 +87,7 @@ async function tryLoadFromCache() {
   } finally {
     state.scanning = false;
     state.scanProgress = null;
+    state.cacheLoading = false;
     renderDashboard();
   }
 }
@@ -117,6 +130,49 @@ function loading(msg = 'Loading...') {
   return `<div class="loading"><div class="spinner"></div>${msg}</div>`;
 }
 
+// ===== Group Filtering =====
+function applyGroupFilters(groups) {
+  console.log('[FILTER] input groups:', groups.length,
+    '| threshold:', state.threshold,
+    '| filters:', JSON.stringify(state.filters));
+
+  if (groups.length && state.filters.catalogPrefix) {
+    const prefix = state.filters.catalogPrefix.toLowerCase();
+    const sample = groups[0];
+    console.log('[FILTER] sample group tables:', sample.tables,
+      '| first catalog:', sample.tables[0]?.split('.')[0],
+      '| prefix test:', sample.tables[0]?.split('.')[0]?.toLowerCase().startsWith(prefix));
+  }
+
+  const result = groups.filter(g => {
+    const tags = g.tags || [];
+
+    if (state.filters.hideGovernanceViews && tags.includes('governance_view'))
+      return false;
+
+    if (state.filters.hidePipelineStages && tags.includes('pipeline_stage'))
+      return false;
+
+    if (state.filters.catalogPrefix) {
+      const prefix = state.filters.catalogPrefix.toLowerCase();
+      const hasMatch = g.tables.some(t => t.split('.')[0].toLowerCase().startsWith(prefix));
+      if (!hasMatch) return false;
+    }
+
+    return true;
+  });
+
+  console.log('[FILTER] result:', result.length);
+  return result;
+}
+
+function filteredGroupsInfo() {
+  const all = state.groups;
+  const filtered = applyGroupFilters(all);
+  const hidden = all.length - filtered.length;
+  return { filtered, total: all.length, hidden };
+}
+
 function permBadges(permissions) {
   if (!permissions || !permissions.length) return '<span class="tag tag-yellow">No grants found</span>';
   return permissions.map(p => {
@@ -147,16 +203,23 @@ async function renderDashboard() {
       Click \u201cScan All Catalogs\u201d to force a fresh scan.</span>
     </div>` : ''}
     <div style="margin-bottom:20px">
-      <button class="btn btn-primary" id="scan-btn" ${state.scanning ? 'disabled' : ''}>
-        ${state.scanning ? '<div class="spinner" style="width:14px;height:14px;margin-right:6px"></div> Scanning\u2026' : 'Scan All Catalogs'}
+      <button class="btn btn-primary" id="scan-btn" ${state.scanning || state.cacheLoading ? 'disabled' : ''}>
+        ${state.scanning ? '<div class="spinner" style="width:14px;height:14px;margin-right:6px"></div> Scanning\u2026' : state.cacheLoading ? '<div class="spinner" style="width:14px;height:14px;margin-right:6px"></div> Checking cache\u2026' : 'Scan All Catalogs'}
       </button>
     </div>
+    ${state.cacheLoading ? `<div class="card" style="margin-bottom:16px;padding:16px;display:flex;align-items:center;gap:10px;border-left:3px solid var(--accent)">
+      <div class="spinner" style="width:16px;height:16px;flex-shrink:0"></div>
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--text)">Loading previous results\u2026</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:2px">${state.scanProgress?.message || 'Checking for cached scan data'}</div>
+      </div>
+    </div>` : ''}
     <div id="scan-progress"></div>
     ${state.scanError ? `<div style="background:var(--red-bg, #2d1b1b);border:1px solid var(--red, #e74c3c);border-radius:6px;padding:16px;margin-bottom:16px">
       <div style="font-weight:700;font-size:14px;color:var(--red, #e74c3c);margin-bottom:8px">Scan failed</div>
       <pre style="font-size:12px;color:var(--text-muted);white-space:pre-wrap;word-break:break-word;margin:0">${state.scanError}</pre>
     </div>` : ''}
-    ${sr ? renderScanSummary(sr) : '<div class="stat-card"><div class="stat-label">Status</div><div class="stat-value" style="font-size:16px;color:var(--text-muted)">Click \u201cScan All Catalogs\u201d to begin</div></div>'}
+    ${sr ? renderScanSummary(sr) : (state.cacheLoading ? '' : '<div class="stat-card"><div class="stat-label">Status</div><div class="stat-value" style="font-size:16px;color:var(--text-muted)">Click \u201cScan All Catalogs\u201d to begin</div></div>')}
     <div id="top-duplicates"></div>
   `;
 
@@ -188,7 +251,7 @@ function renderScanSummary(sr) {
       <div class="stat-card"><div class="stat-label">Schemas</div><div class="stat-value">${t.schema_count}</div></div>
       <div class="stat-card"><div class="stat-label">Tables</div><div class="stat-value">${t.table_count}</div></div>
       <div class="stat-card"><div class="stat-label">Columns</div><div class="stat-value">${t.column_count}</div></div>
-      <div class="stat-card"><div class="stat-label">Duplicate Groups</div><div class="stat-value accent">${state.groups.length}</div></div>
+      <div class="stat-card"><div class="stat-label">Duplicate Groups</div><div class="stat-value accent">${filteredGroupsInfo().filtered.length}${filteredGroupsInfo().hidden ? ` <span style="font-size:12px;font-weight:400;color:var(--text-muted)">(${filteredGroupsInfo().hidden} hidden)</span>` : ''}</div></div>
     </div>
     <div class="section" style="margin-top:20px">
       <div class="section-title">Catalogs</div>
@@ -344,14 +407,15 @@ async function doScan() {
 
 function renderTopDuplicates() {
   const el = $('top-duplicates');
-  if (!state.groups.length) {
-    el.innerHTML = '<div class="card"><div class="empty-state"><h3>No duplicates detected</h3><p>All tables appear unique across all catalogs.</p></div></div>';
+  const { filtered, hidden } = filteredGroupsInfo();
+  if (!filtered.length) {
+    el.innerHTML = '<div class="card"><div class="empty-state"><h3>No duplicates detected</h3><p>All tables appear unique across all catalogs' + (hidden ? ` (${hidden} groups hidden by filters).` : '.') + '</p></div></div>';
     return;
   }
   el.innerHTML = `
     <div class="section-title" style="margin-top:24px">Top Duplicate Groups</div>
-    ${state.groups.slice(0, 5).map(g => renderDupGroupCard(g)).join('')}
-    ${state.groups.length > 5 ? `<p style="color:var(--text-muted);font-size:13px">+ ${state.groups.length - 5} more groups. <a href="#/duplicates" style="color:var(--accent)">View all</a></p>` : ''}
+    ${filtered.slice(0, 5).map(g => renderDupGroupCard(g)).join('')}
+    ${filtered.length > 5 ? `<p style="color:var(--text-muted);font-size:13px">+ ${filtered.length - 5} more groups. <a href="#/duplicates" style="color:var(--accent)">View all</a></p>` : ''}
   `;
 }
 
@@ -482,6 +546,8 @@ async function renderDuplicates() {
     return;
   }
 
+  const { filtered, total, hidden } = filteredGroupsInfo();
+
   main().innerHTML = `
     <h2 class="page-title">Duplicate Detection</h2>
     <p class="page-desc">Tables across <strong>${(state.scanResult?.catalogs_scanned || []).length}</strong> catalog(s) grouped by similarity. The gold badge marks the recommended standard dataset.</p>
@@ -491,8 +557,53 @@ async function renderDuplicates() {
       <span class="threshold-value" id="threshold-val">${(state.threshold * 100).toFixed(0)}%</span>
       <button class="btn btn-outline btn-sm" id="redetect-btn">Re-detect</button>
     </div>
-    <div id="dup-groups">${state.groups.length ? state.groups.map(g => renderDupGroupCard(g)).join('') : '<div class="empty-state"><h3>No duplicates found</h3><p>Try lowering the threshold.</p></div>'}</div>
+    <div class="card" style="margin-bottom:16px;padding:14px">
+      <div style="font-weight:600;font-size:13px;margin-bottom:10px">Filters</div>
+      <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="filter-gov" ${state.filters.hideGovernanceViews ? 'checked' : ''} />
+          Hide governance views
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="filter-pipeline" ${state.filters.hidePipelineStages ? 'checked' : ''} />
+          Hide medallion pipeline stages
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Catalog prefix
+          <input type="text" id="filter-prefix" value="${state.filters.catalogPrefix}" placeholder="e.g. catalog_40_copper" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:220px" />
+        </label>
+      </div>
+      ${hidden ? `<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Showing ${filtered.length} of ${total} groups (${hidden} filtered)</div>` : ''}
+    </div>
+    <div id="dup-groups">${filtered.length ? filtered.slice(0, state.groupsShown).map(g => renderDupGroupCard(g)).join('') + (filtered.length > state.groupsShown ? `<div style="text-align:center;padding:16px"><button class="btn btn-outline" id="show-more-btn">Show more (${state.groupsShown} of ${filtered.length})</button></div>` : '') : '<div class="empty-state"><h3>No duplicates found</h3><p>Try adjusting the threshold or filters.</p></div>'}</div>
   `;
+
+  // ── Filter event handlers ──
+  function onFilterChange() {
+    state.filters.hideGovernanceViews = $('filter-gov').checked;
+    state.filters.hidePipelineStages = $('filter-pipeline').checked;
+    state.filters.catalogPrefix = $('filter-prefix').value.trim();
+    state.groupsShown = state.groupsPageSize;  // reset pagination on filter change
+    renderDuplicates();
+  }
+
+  $('filter-gov').onchange = onFilterChange;
+  $('filter-pipeline').onchange = onFilterChange;
+
+  // "Show more" button — appends next page without full re-render
+  const showMoreBtn = $('show-more-btn');
+  if (showMoreBtn) {
+    showMoreBtn.onclick = () => {
+      state.groupsShown += state.groupsPageSize;
+      renderDuplicates();
+    };
+  }
+
+  let _prefixTimer = null;
+  $('filter-prefix').oninput = () => {
+    clearTimeout(_prefixTimer);
+    _prefixTimer = setTimeout(onFilterChange, 400);  // debounce
+  };
 
   $('threshold-slider').oninput = (e) => {
     state.threshold = parseFloat(e.target.value);
@@ -500,11 +611,37 @@ async function renderDuplicates() {
   };
 
   $('redetect-btn').onclick = async () => {
+    $('redetect-btn').disabled = true;
     $('dup-groups').innerHTML = loading('Detecting duplicates\u2026');
-    state.groups = await API.detectDuplicates(state.threshold);
-    $('dup-groups').innerHTML = state.groups.length
-      ? state.groups.map(g => renderDupGroupCard(g)).join('')
-      : '<div class="empty-state"><h3>No duplicates found</h3><p>Try lowering the threshold.</p></div>';
+
+    try {
+      await API.detectDuplicates(state.threshold);
+
+      // Poll until detection completes
+      while (true) {
+        await new Promise(r => setTimeout(r, 2000));
+        const status = await API.detectStatus();
+
+        if (status.state === 'completed') {
+          state.groups = await API.getGroups();
+          break;
+        }
+        if (status.state === 'failed') {
+          $('dup-groups').innerHTML = `<div class="empty-state"><h3>Detection failed</h3><p>${status.message || status.error}</p></div>`;
+          $('redetect-btn').disabled = false;
+          return;
+        }
+        // Still running — keep polling
+        $('dup-groups').innerHTML = loading(status.message || 'Detecting duplicates\u2026');
+      }
+    } catch (e) {
+      $('dup-groups').innerHTML = `<div class="empty-state"><h3>Detection failed</h3><p>${e.message}</p></div>`;
+      $('redetect-btn').disabled = false;
+      return;
+    }
+
+    $('redetect-btn').disabled = false;
+    renderDuplicates();
   };
 }
 
@@ -534,8 +671,8 @@ function renderDupGroupCard(g) {
           <tbody>
             ${g.pairs.slice(0, 6).map(p => {
               return `<tr>
-                <td style="font-weight:500">${p.table_a}</td>
-                <td style="font-weight:500">${p.table_b}</td>
+                <td style="font-weight:500" title="${p.table_a}">${p.table_a}</td>
+                <td style="font-weight:500" title="${p.table_b}">${p.table_b}</td>
                 <td>${(p.column_similarity * 100).toFixed(0)}%</td>
                 <td>${(p.type_similarity * 100).toFixed(0)}%</td>
                 <td>${(p.name_similarity * 100).toFixed(0)}%</td>
@@ -676,7 +813,7 @@ async function renderCompare() {
 
   main().innerHTML = `
     <h2 class="page-title">Compare Tables</h2>
-    <p class="page-desc">Side-by-side schema diff, permissions, and sample data comparison.</p>
+    <p class="page-desc">Side-by-side schema diff and permissions comparison.</p>
     <div id="compare-form"></div>
     <div id="compare-result"></div>
   `;
@@ -697,19 +834,15 @@ async function doCompare() {
   el.innerHTML = loading('Comparing tables\u2026');
 
   try {
-    const [result, sampleA, sampleB] = await Promise.all([
-      API.compareTables(c1, s1, t1, c2, s2, t2),
-      API.getSample(c1, s1, t1).catch(() => null),
-      API.getSample(c2, s2, t2).catch(() => null),
-    ]);
+    const result = await API.compareTables(c1, s1, t1, c2, s2, t2);
     state.compareResult = result;
-    renderCompareResult(result, sampleA, sampleB);
+    renderCompareResult(result);
   } catch (e) {
     el.innerHTML = `<div class="empty-state"><h3>Comparison failed</h3><p>${e.message}</p></div>`;
   }
 }
 
-function renderCompareResult(r, sampleA, sampleB) {
+function renderCompareResult(r) {
   const el = $('compare-result');
   el.innerHTML = `
     <div class="compare-grid" style="margin-bottom:20px">
@@ -777,19 +910,7 @@ function renderCompareResult(r, sampleA, sampleB) {
       </table>
     </div>
 
-    <div class="section">
-      <div class="section-title">Sample Data</div>
-      <div class="compare-grid">
-        <div>
-          <h4 style="font-size:13px;font-weight:600;margin-bottom:8px">${r.table_a.full_name}</h4>
-          ${sampleA ? renderSampleTable(sampleA) : '<p style="color:var(--text-muted);font-size:13px">Could not load sample data</p>'}
-        </div>
-        <div>
-          <h4 style="font-size:13px;font-weight:600;margin-bottom:8px">${r.table_b.full_name}</h4>
-          ${sampleB ? renderSampleTable(sampleB) : '<p style="color:var(--text-muted);font-size:13px">Could not load sample data</p>'}
-        </div>
-      </div>
-    </div>
+
   `;
 }
 

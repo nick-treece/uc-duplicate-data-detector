@@ -42,9 +42,13 @@ const API = {
     return this.get(`/catalog/table/${catalog}/${schema}/${table}`);
   },
 
+  /** Start background re-detection. Returns immediately. */
   detectDuplicates(threshold = 0.5) {
-    return this.get('/duplicates/detect' + this._qs({ threshold }));
+    return this.post('/duplicates/detect' + this._qs({ threshold }));
   },
+
+  /** Poll detection progress. */
+  detectStatus() { return this.get('/duplicates/detect-status'); },
 
   getGroups() { return this.get('/duplicates/groups'); },
 
