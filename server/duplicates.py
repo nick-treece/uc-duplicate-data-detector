@@ -131,6 +131,7 @@ class DuplicateGroup:
     pairs: list[DuplicatePair]
     gold_standard: str | None = None
     gold_scores: dict = field(default_factory=dict)
+    tags: list[str] = field(default_factory=list)
 
     def to_dict(self):
         return {
@@ -140,6 +141,7 @@ class DuplicateGroup:
             "pairs": [asdict(p) for p in self.pairs],
             "gold_standard": self.gold_standard,
             "gold_scores": self.gold_scores,
+            "tags": self.tags,
         }
 
 
@@ -177,6 +179,85 @@ def _build_candidate_pairs(
                 time.sleep(0)  # yield GIL for HTTP threads
 
     return candidates
+
+
+# ── Group tagging ─────────────────────────────────────────────────────────
+
+_MEDALLION_KEYWORDS = {"gold", "silver", "bronze"}
+
+
+def _get_medallion_tier(catalog_name: str) -> str | None:
+    """Return the medallion tier if the catalog name contains one, else None."""
+    lower = catalog_name.lower()
+    for tier in _MEDALLION_KEYWORDS:
+        if tier in lower:
+            return tier
+    return None
+
+
+def _tag_governance_views(
+    groups: list[DuplicateGroup],
+    table_map: dict[str, TableInfo],
+):
+    """Tag 2-table groups where a VIEW's columns are a subset of the paired TABLE."""
+    for group in groups:
+        if len(group.tables) != 2:
+            continue
+
+        ta = table_map.get(group.tables[0])
+        tb = table_map.get(group.tables[1])
+        if not ta or not tb:
+            continue
+
+        # Identify which is the view and which is the table
+        if ta.table_type.upper() == "VIEW" and tb.table_type.upper() != "VIEW":
+            view, tbl = ta, tb
+        elif tb.table_type.upper() == "VIEW" and ta.table_type.upper() != "VIEW":
+            view, tbl = tb, ta
+        else:
+            continue  # both views or both tables
+
+        # Check if view columns are a subset of the table columns
+        view_cols = {_canonical_col(c.name) for c in view.columns}
+        tbl_cols = {_canonical_col(c.name) for c in tbl.columns}
+        if view_cols and view_cols <= tbl_cols:
+            group.tags.append("governance_view")
+
+
+def _tag_pipeline_stages(groups: list[DuplicateGroup]):
+    """Tag groups that span multiple medallion tiers (gold/silver/bronze only).
+
+    Groups are tagged ``pipeline_stage`` only when **every** table in the
+    group belongs to a medallion catalog (contains 'gold', 'silver', or
+    'bronze') **and** the group spans two or more distinct tiers.
+
+    Groups containing any non-medallion catalog are left untagged — these
+    represent potential duplication worth investigating.
+    """
+    for group in groups:
+        tiers: set[str] = set()
+        all_medallion = True
+
+        for full_name in group.tables:
+            catalog = full_name.split(".")[0]
+            tier = _get_medallion_tier(catalog)
+            if tier:
+                tiers.add(tier)
+            else:
+                all_medallion = False
+                break
+
+        if all_medallion and len(tiers) >= 2:
+            group.tags.append("pipeline_stage")
+
+
+def _apply_tags(
+    groups: list[DuplicateGroup],
+    table_map: dict[str, TableInfo],
+):
+    """Run all taggers on the given groups."""
+    _tag_governance_views(groups, table_map)
+    _tag_pipeline_stages(groups)
 
 
 def detect_duplicates(
@@ -226,6 +307,9 @@ def detect_duplicates(
         group.gold_scores = scores
         if scores:
             group.gold_standard = max(scores, key=scores.get)
+
+    # ── Tag groups for filtering ──────────────────────────────────────────
+    _apply_tags(groups, table_map)
 
     return groups
 

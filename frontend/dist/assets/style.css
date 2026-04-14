@@ -98,7 +98,7 @@ body {
   flex: 1;
   padding: 32px;
   overflow-y: auto;
-  max-width: 1400px;
+  min-width: 0;
 }
 
 .page-title {
@@ -209,6 +209,7 @@ body {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+  table-layout: fixed;
 }
 
 .data-table th {
@@ -226,6 +227,9 @@ body {
   padding: 10px 12px;
   border-bottom: 1px solid var(--border);
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .data-table tr:hover td { background: var(--bg-card-hover); }
@@ -290,6 +294,7 @@ body {
   padding: 20px;
   margin-bottom: 16px;
   transition: border-color var(--transition);
+  overflow: hidden;
 }
 
 .dup-group:hover { border-color: var(--accent); }
@@ -675,3 +680,36 @@ select:focus, input:focus { outline: none; border-color: var(--accent); }
 .tree-catalog-children { padding-left: 8px; }
 
 .tree-toggle { user-select: none; }
+
+/* ===== Duplicate group table overflow ===== */
+.dup-group .data-table td[title] {
+  cursor: help;
+}
+
+.dup-group .data-table td:nth-child(1),
+.dup-group .data-table td:nth-child(2) {
+  max-width: 0;
+}
+
+.dup-group .data-table th:nth-child(1),
+.dup-group .data-table th:nth-child(2) {
+  width: 30%;
+}
+
+.dup-group .data-table th:nth-last-child(1) {
+  width: 70px;
+}
+
+.dup-table-tag {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 400px;
+}
+
+.gold-badge {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}

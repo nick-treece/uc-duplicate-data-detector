@@ -701,6 +701,71 @@ class CatalogScanner:
     def get_all_tables_raw(self) -> list[TableInfo]:
         return self._tables
 
+    # ── Background re-detection ───────────────────────────────────────────
+
+    def start_detection(self, threshold: float = 0.5) -> dict:
+        """Launch duplicate detection in a background thread.
+
+        Returns immediately.  If a scan is already running, returns its
+        status instead of starting a conflicting detection.
+        """
+        with self._scan_lock:
+            if self._scan_status["state"] == "running":
+                return {"state": "busy", "message": "A scan is already running"}
+
+        self._update_status(
+            state="running",
+            message="Detecting duplicates\u2026",
+            phase="detection",
+        )
+
+        t = threading.Thread(
+            target=self._run_detection_background,
+            args=(threshold,),
+            daemon=True,
+        )
+        t.start()
+        return {"state": "started", "message": "Detection started"}
+
+    def _run_detection_background(self, threshold: float):
+        """Run detection + tagging in background thread.
+
+        Does NOT write to cache — re-detection is an interactive parameter
+        tweak, not a new scan.  Results persist in memory until the next
+        full scan writes them to cache.
+        """
+        try:
+            # Ensure columns are loaded (they may be missing after a
+            # cache restore which only loads summary data).
+            tables_missing_cols = not any(t.columns for t in self._tables)
+            if tables_missing_cols:
+                self._update_status(
+                    message="Loading column metadata\u2026",
+                )
+                self.bulk_load_columns()
+
+            from server.duplicates import detect_duplicates
+
+            self._update_status(message="Comparing tables\u2026")
+            groups = detect_duplicates(self._tables, threshold=threshold)
+            self._duplicate_groups = [g.to_dict() for g in groups]
+
+            with self._scan_lock:
+                self._scan_status["state"] = "completed"
+                self._scan_status["message"] = (
+                    f"Detection complete \u2014 {len(self._duplicate_groups)} groups"
+                )
+                self._scan_status["result"] = {
+                    "groups_count": len(self._duplicate_groups),
+                }
+
+        except Exception as e:
+            logger.exception("Background detection failed")
+            with self._scan_lock:
+                self._scan_status["state"] = "failed"
+                self._scan_status["message"] = f"Detection failed: {e}"
+                self._scan_status["error"] = str(e)
+
     # ── Bulk loading (fast startup from cache) ────────────────────────────
 
     def _skip_catalogs_sql(self) -> str:
@@ -740,6 +805,64 @@ class CatalogScanner:
                 comment=row[5],
             ))
         logger.info(f"Bulk-loaded {len(self._tables)} tables")
+
+    def bulk_load_columns(self):
+        """Load columns for all tables, one catalog at a time.
+
+        Used when re-detection needs column data but tables were restored
+        from cache (which only stores summary data without columns).
+        Queries per-catalog to keep each result set manageable.
+        """
+        src = self._METADATA_SOURCE
+
+        # Group tables by catalog
+        catalogs: dict[str, list[TableInfo]] = defaultdict(list)
+        for t in self._tables:
+            catalogs[t.catalog].append(t)
+
+        total_cats = len(catalogs)
+        total_cols = 0
+
+        for i, (catalog, cat_tables) in enumerate(sorted(catalogs.items())):
+            if i % 10 == 0:
+                self._update_status(
+                    message=f"Loading columns\u2026 {i}/{total_cats} catalogs",
+                )
+                time.sleep(0)  # yield GIL
+
+            col_rows = self._run_sql(
+                f"SELECT table_schema, table_name, column_name, "
+                f"       full_data_type, ordinal_position, is_nullable, comment "
+                f"FROM {src}.columns "
+                f"WHERE table_catalog = '{catalog}' "
+                f"  AND table_schema != 'information_schema' "
+                f"ORDER BY table_schema, table_name, ordinal_position",
+                quiet=True,
+            )
+            if not col_rows:
+                continue
+
+            col_lookup: dict[tuple, list[ColumnInfo]] = defaultdict(list)
+            for row in col_rows:
+                col_lookup[(row[0], row[1])].append(ColumnInfo(
+                    name=row[2],
+                    type_name=row[3] or "unknown",
+                    position=int(row[4]) if row[4] else 0,
+                    nullable=row[5] != "NO",
+                    comment=row[6],
+                ))
+
+            for table in cat_tables:
+                key = (table.schema, table.name)
+                if key in col_lookup:
+                    table.columns = col_lookup[key]
+                    total_cols += len(col_lookup[key])
+
+        logger.info(
+            f"bulk_load_columns: {total_cols} columns loaded "
+            f"across {total_cats} catalogs"
+        )
+
 
     def bulk_load_schemas(self):
         """Load all schemas in one query and compute table counts."""

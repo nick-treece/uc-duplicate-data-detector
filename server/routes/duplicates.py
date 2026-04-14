@@ -10,30 +10,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/duplicates", tags=["duplicates"])
 
 
-@router.get("/detect")
+@router.post("/detect")
 def detect(threshold: float = Query(0.5, ge=0.1, le=1.0)):
-    """Force a fresh duplicate detection (e.g. after threshold change).
+    """Start a background re-detection with a new threshold.
 
-    For normal scans, detection runs in the background thread and
-    results are available via GET /groups.
+    Returns immediately.  Poll GET /detect-status for progress,
+    then GET /groups for results.
     """
-    try:
-        if not scanner.is_scanned:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No scan has been run yet"},
-            )
-
-        tables = scanner.get_all_tables_raw()
-        groups = detect_duplicates(tables, threshold=threshold)
-        group_dicts = [g.to_dict() for g in groups]
-        scanner.set_duplicate_groups(group_dicts)
-        return group_dicts
-    except Exception as e:
+    if not scanner.is_scanned:
         return JSONResponse(
-            status_code=500,
-            content={"error": str(e), "traceback": traceback.format_exc()},
+            status_code=400,
+            content={"error": "No scan has been run yet"},
         )
+
+    return scanner.start_detection(threshold)
+
+
+@router.get("/detect-status")
+def detect_status():
+    """Poll detection progress (reuses scan status infrastructure)."""
+    return scanner.get_scan_status()
 
 
 @router.get("/groups")
