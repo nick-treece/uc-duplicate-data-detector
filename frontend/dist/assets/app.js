@@ -18,6 +18,7 @@ let state = {
   filters: {
     hideGovernanceViews: true,
     hidePipelineStages: true,
+    hideSharedSource: false,
     catalogPrefix: '',
   },
   groupsPageSize: 50,
@@ -151,6 +152,9 @@ function applyGroupFilters(groups) {
       return false;
 
     if (state.filters.hidePipelineStages && tags.includes('pipeline_stage'))
+      return false;
+
+    if (state.filters.hideSharedSource && tags.includes('shared_source'))
       return false;
 
     if (state.filters.catalogPrefix) {
@@ -565,6 +569,10 @@ async function renderDuplicates() {
           Hide governance views
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="filter-shared-source" ${state.filters.hideSharedSource ? 'checked' : ''} />
+          Hide shared-source groups
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
           <input type="checkbox" id="filter-pipeline" ${state.filters.hidePipelineStages ? 'checked' : ''} />
           Hide medallion pipeline stages
         </label>
@@ -582,6 +590,7 @@ async function renderDuplicates() {
   function onFilterChange() {
     state.filters.hideGovernanceViews = $('filter-gov').checked;
     state.filters.hidePipelineStages = $('filter-pipeline').checked;
+    state.filters.hideSharedSource = $('filter-shared-source').checked;
     state.filters.catalogPrefix = $('filter-prefix').value.trim();
     state.groupsShown = state.groupsPageSize;  // reset pagination on filter change
     renderDuplicates();
@@ -589,6 +598,7 @@ async function renderDuplicates() {
 
   $('filter-gov').onchange = onFilterChange;
   $('filter-pipeline').onchange = onFilterChange;
+  $('filter-shared-source').onchange = onFilterChange;
 
   // "Show more" button — appends next page without full re-render
   const showMoreBtn = $('show-more-btn');
@@ -667,7 +677,7 @@ function renderDupGroupCard(g) {
       ${g.gold_standard ? `<div style="margin-top:8px"><span class="gold-badge">\u2605 Gold Standard: ${g.gold_standard}</span></div>` : ''}
       <div style="margin-top:12px">
         <table class="data-table">
-          <thead><tr><th>Table A</th><th>Table B</th><th>Columns</th><th>Types</th><th>Name</th><th>Score</th><th></th></tr></thead>
+          <thead><tr><th>Table A</th><th>Table B</th><th>Columns</th><th>Types</th><th>Name</th><th>Lineage</th><th>Score</th><th></th></tr></thead>
           <tbody>
             ${g.pairs.slice(0, 6).map(p => {
               return `<tr>
@@ -676,6 +686,7 @@ function renderDupGroupCard(g) {
                 <td>${(p.column_similarity * 100).toFixed(0)}%</td>
                 <td>${(p.type_similarity * 100).toFixed(0)}%</td>
                 <td>${(p.name_similarity * 100).toFixed(0)}%</td>
+                <td>${(p.lineage_similarity * 100).toFixed(0)}%</td>
                 <td><span class="similarity-score" style="color:${similarityColor(p.composite_score)}">${(p.composite_score * 100).toFixed(0)}%</span></td>
                 <td><button class="btn btn-outline btn-sm compare-btn" data-a="${p.table_a}" data-b="${p.table_b}">Compare</button></td>
               </tr>`;
@@ -888,6 +899,104 @@ function renderCompareResult(r) {
       </table>
     </div>
     ` : ''}
+
+    ${r.lineage && r.lineage.has_lineage ? `
+    <div class="section">
+      <div class="section-title">Lineage Comparison</div>
+
+      <!-- Consumer counts -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <div style="background:var(--bg-secondary);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:12px;color:var(--text-muted)">Consumers of A</div>
+          <div style="font-size:20px;font-weight:600">${r.lineage.consumer_counts.a}</div>
+        </div>
+        <div style="background:var(--bg-secondary);padding:12px;border-radius:8px;text-align:center">
+          <div style="font-size:12px;color:var(--text-muted)">Consumers of B</div>
+          <div style="font-size:20px;font-weight:600">${r.lineage.consumer_counts.b}</div>
+        </div>
+      </div>
+
+      <!-- Direct flow banner -->
+      ${r.lineage.direct_flow ? `
+        <div style="margin-bottom:16px;padding:10px 14px;background:var(--accent-bg);border-left:3px solid var(--accent);border-radius:4px">
+          <strong>Direct data flow:</strong> ${r.lineage.direct_flow.source} \u2192 ${r.lineage.direct_flow.target}
+          ${r.lineage.direct_flow.entity_types.length ? `<br><span style="color:var(--text-muted);font-size:13px">Via: ${r.lineage.direct_flow.entity_types.join(", ")}</span>` : ""}
+        </div>
+      ` : ""}
+
+      <!-- Shared upstream -->
+      ${r.lineage.shared_upstream.length ? `
+        <div style="margin-bottom:16px">
+          <strong>Shared upstream sources (${r.lineage.shared_upstream.length}):</strong>
+          <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">
+            ${r.lineage.shared_upstream.map(t => `<span class="tag tag-accent">${t}</span>`).join("")}
+          </div>
+        </div>
+      ` : ""}
+
+      <!-- Side-by-side upstream/downstream -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <div>
+          <div style="font-weight:600;margin-bottom:8px;font-size:13px">Upstream of A (${r.lineage.upstream_a.length})</div>
+          ${r.lineage.upstream_a.length ? `
+            <div style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px">
+              ${r.lineage.upstream_a.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all;${r.lineage.shared_upstream.includes(t) ? 'background:var(--accent-bg);border-color:var(--accent)' : ''}">${t}</span>`).join("")}
+            </div>
+          ` : `<span style="color:var(--text-muted);font-size:13px">None found</span>`}
+        </div>
+        <div>
+          <div style="font-weight:600;margin-bottom:8px;font-size:13px">Upstream of B (${r.lineage.upstream_b.length})</div>
+          ${r.lineage.upstream_b.length ? `
+            <div style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px">
+              ${r.lineage.upstream_b.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all;${r.lineage.shared_upstream.includes(t) ? 'background:var(--accent-bg);border-color:var(--accent)' : ''}">${t}</span>`).join("")}
+            </div>
+          ` : `<span style="color:var(--text-muted);font-size:13px">None found</span>`}
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <div>
+          <div style="font-weight:600;margin-bottom:8px;font-size:13px">Downstream of A (${r.lineage.downstream_a.length})</div>
+          ${r.lineage.downstream_a.length ? `
+            <div style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px">
+              ${r.lineage.downstream_a.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all">${t}</span>`).join("")}
+            </div>
+          ` : `<span style="color:var(--text-muted);font-size:13px">None found</span>`}
+        </div>
+        <div>
+          <div style="font-weight:600;margin-bottom:8px;font-size:13px">Downstream of B (${r.lineage.downstream_b.length})</div>
+          ${r.lineage.downstream_b.length ? `
+            <div style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px">
+              ${r.lineage.downstream_b.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all">${t}</span>`).join("")}
+            </div>
+          ` : `<span style="color:var(--text-muted);font-size:13px">None found</span>`}
+        </div>
+      </div>
+
+      <!-- Column-level lineage -->
+      ${r.lineage.column_mappings.length ? `
+        <div>
+          <strong>Column-level lineage (${r.lineage.column_mappings.length} mappings):</strong>
+          <table class="data-table" style="margin-top:8px;font-size:12px">
+            <thead><tr>
+              <th>Source Table</th><th>Source Column</th>
+              <th>Target Table</th><th>Target Column</th>
+            </tr></thead>
+            <tbody>
+              ${r.lineage.column_mappings.map(m => `
+                <tr>
+                  <td style="font-size:11px;color:var(--text-muted)">${m.source_table}</td>
+                  <td style="font-weight:600">${m.source_col}</td>
+                  <td style="font-size:11px;color:var(--text-muted)">${m.target_table}</td>
+                  <td style="font-weight:600">${m.target_col}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : ""}
+    </div>
+  ` : ""}
 
     <div class="section">
       <div class="section-title">Column Schema Diff</div>

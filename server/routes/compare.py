@@ -1,9 +1,12 @@
+import logging
 import traceback
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from server.scanner import scanner, TableInfo
-from server.comparator import compare_tables, fetch_sample_data
+from server.comparator import compare_tables, fetch_sample_data, build_lineage_context
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/compare", tags=["compare"])
 
@@ -51,7 +54,31 @@ def compare(cat1: str, schema1: str, table1: str, cat2: str, schema2: str, table
     try:
         ta = _get_table_info(cat1, schema1, table1)
         tb = _get_table_info(cat2, schema2, table2)
-        return compare_tables(ta, tb)
+        result = compare_tables(ta, tb)
+
+        # Attach lineage context if available
+        try:
+            col_mappings = scanner.query_column_lineage(ta.full_name, tb.full_name)
+            lineage_ctx = build_lineage_context(
+                table_a_name=ta.full_name,
+                table_b_name=tb.full_name,
+                upstream_map=scanner._upstream_map,
+                downstream_map=scanner._downstream_map,
+                consumer_counts=scanner._consumer_counts,
+                column_mappings=col_mappings,
+                lineage_edges=scanner._lineage_edges,
+            )
+            result["lineage"] = lineage_ctx
+        except Exception as lineage_err:
+            import traceback as tb
+            logger.error(f"Lineage context failed: {lineage_err}")
+            logger.error(tb.format_exc())
+            result["lineage"] = {
+                "has_lineage": False,
+                "error": str(lineage_err),
+            }
+
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -59,3 +86,28 @@ def compare(cat1: str, schema1: str, table1: str, cat2: str, schema2: str, table
             status_code=500,
             content={"error": str(e), "traceback": traceback.format_exc()},
         )
+
+
+@router.get("/debug/lineage-status")
+def lineage_status():
+    """Debug endpoint: returns scanner lineage state."""
+    upstream_size = len(scanner._upstream_map) if hasattr(scanner, '_upstream_map') else -1
+    downstream_size = len(scanner._downstream_map) if hasattr(scanner, '_downstream_map') else -1
+    edges_size = len(scanner._lineage_edges) if hasattr(scanner, '_lineage_edges') else -1
+    consumers_size = len(scanner._consumer_counts) if hasattr(scanner, '_consumer_counts') else -1
+
+    # Sample: first 5 entries from upstream_map
+    sample_upstream = {}
+    if hasattr(scanner, '_upstream_map') and scanner._upstream_map:
+        for k, v in list(scanner._upstream_map.items())[:5]:
+            sample_upstream[k] = sorted(v)[:3]
+
+    return {
+        "is_scanned": scanner.is_scanned,
+        "upstream_map_size": upstream_size,
+        "downstream_map_size": downstream_size,
+        "lineage_edges_size": edges_size,
+        "consumer_counts_size": consumers_size,
+        "upstream_map_type": type(scanner._upstream_map).__name__ if hasattr(scanner, '_upstream_map') else "missing",
+        "sample_upstream": sample_upstream,
+    }

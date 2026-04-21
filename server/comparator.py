@@ -102,6 +102,85 @@ def compare_tables(table_a: TableInfo, table_b: TableInfo) -> dict:
     }
 
 
+def build_lineage_context(
+    table_a_name: str,
+    table_b_name: str,
+    upstream_map: dict,
+    downstream_map: dict,
+    consumer_counts: dict,
+    column_mappings: list,
+    lineage_edges: list,
+) -> dict:
+    """Build lineage context for the compare page between two tables."""
+    a = table_a_name.lower()
+    b = table_b_name.lower()
+
+    # Direct flow between the two tables
+    a_downstream = downstream_map.get(a, set())
+    b_downstream = downstream_map.get(b, set())
+    direct_flow = None
+    if b in a_downstream:
+        direct_flow = {"direction": "a_to_b", "source": table_a_name, "target": table_b_name}
+    elif a in b_downstream:
+        direct_flow = {"direction": "b_to_a", "source": table_b_name, "target": table_a_name}
+
+    # Entity types for the direct flow
+    flow_entity_types = []
+    if direct_flow:
+        for edge in lineage_edges:
+            if edge.source_table == a and edge.target_table == b:
+                flow_entity_types = sorted(edge.entity_types)
+                break
+            elif edge.source_table == b and edge.target_table == a:
+                flow_entity_types = sorted(edge.entity_types)
+                break
+        # Drop "UNKNOWN" when real entity types are present
+        if len(flow_entity_types) > 1:
+            flow_entity_types = [t for t in flow_entity_types if t != "UNKNOWN"]
+        direct_flow["entity_types"] = flow_entity_types
+
+    # Shared upstream sources
+    a_upstream = upstream_map.get(a, set())
+    b_upstream = upstream_map.get(b, set())
+    shared_upstream = sorted(a_upstream & b_upstream)
+
+    # Consumer counts
+    a_consumers = consumer_counts.get(a, 0)
+    b_consumers = consumer_counts.get(b, 0)
+
+    # Column-level mappings (pre-queried on demand for this pair)
+    col_mappings = column_mappings or []
+
+    has_lineage = bool(
+        direct_flow or shared_upstream or a_consumers or b_consumers or col_mappings
+    )
+
+    # Per-table lineage profiles (for side-by-side comparison)
+    upstream_a = sorted(a_upstream)
+    upstream_b = sorted(b_upstream)
+    downstream_a = sorted(a_downstream)
+    downstream_b = sorted(b_downstream)
+
+    has_lineage = bool(
+        direct_flow or shared_upstream
+        or a_consumers or b_consumers
+        or col_mappings
+        or upstream_a or upstream_b
+        or downstream_a or downstream_b
+    )
+
+    return {
+        "has_lineage": has_lineage,
+        "direct_flow": direct_flow,
+        "shared_upstream": shared_upstream,
+        "consumer_counts": {"a": a_consumers, "b": b_consumers},
+        "column_mappings": col_mappings,
+        "upstream_a": upstream_a,
+        "upstream_b": upstream_b,
+        "downstream_a": downstream_a,
+        "downstream_b": downstream_b,
+    }
+
 def fetch_sample_data(full_name: str, limit: int = 10) -> Optional[dict]:
     """Fetch sample rows via SQL warehouse using the SDK's API client."""
     try:

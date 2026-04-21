@@ -17,14 +17,20 @@ in the tables as an auditable version history.
 Invalidation rules
 ------------------
 1. Latest cache older than ``CACHE_MAX_AGE_DAYS`` (7 days).
-2. ``CACHE_VERSION`` in code differs from the stored version (covers
-   schema changes to the cache tables during development).
+2. Automatic fingerprint mismatch — ``CACHE_VERSION`` is computed at
+   import time from the cache contract (dataclass fields, DDL columns,
+   detection algorithm defaults).  Any structural or algorithmic change
+   invalidates stale caches without manual version bumps.
 """
 
 from __future__ import annotations
 
+import hashlib
+import re
+import inspect
 import json
 import logging
+from dataclasses import fields as dc_fields
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -34,8 +40,71 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────
 CACHE_SCHEMA = "catalog_40_copper_uc_metadata.cache"
-CACHE_VERSION = "3"
 CACHE_MAX_AGE_DAYS = 7
+
+# Cache table DDL — single source of truth for both ensure_schema()
+# and the fingerprint.  Column names are derived automatically.
+_TABLE_DDLS = {
+    "cache_metadata": """
+        scan_id          INT,
+        cache_version    STRING,
+        cached_at        TIMESTAMP,
+        scan_result_json STRING
+    """,
+    "duplicate_groups": """
+        scan_id          INT,
+        group_id         INT,
+        label            STRING,
+        tables_json      STRING,
+        pairs_json       STRING,
+        gold_standard    STRING,
+        gold_scores_json STRING,
+        tags_json        STRING
+    """,
+}
+
+_COL_PATTERN = re.compile(r"(\w+)\s+(?:INT|STRING|TIMESTAMP)\b")
+_DDL_COLUMNS = {
+    table: _COL_PATTERN.findall(ddl) for table, ddl in _TABLE_DDLS.items()
+}
+
+
+def _compute_cache_fingerprint() -> str:
+    """Derive a deterministic version string from the cache contract.
+
+    Inputs hashed:
+      1. DuplicateGroup / DuplicatePair field names  (what gets serialised)
+      2. Cache table DDL column names                 (what gets stored)
+      3. detect_duplicates numeric defaults            (algorithm parameters)
+
+    Any structural or algorithmic change produces a new fingerprint,
+    automatically invalidating stale caches without manual version bumps.
+    """
+    from server.duplicates import DuplicateGroup, DuplicatePair, detect_duplicates
+
+    group_fields = [f.name for f in dc_fields(DuplicateGroup)]
+    pair_fields = [f.name for f in dc_fields(DuplicatePair)]
+
+    sig = inspect.signature(detect_duplicates)
+    algo_defaults = {
+        name: param.default
+        for name, param in sig.parameters.items()
+        if param.default is not inspect.Parameter.empty
+        and isinstance(param.default, (int, float))
+    }
+
+    contract = {
+        "group_fields": group_fields,
+        "pair_fields": pair_fields,
+        "ddl_columns": _DDL_COLUMNS,
+        "algo_defaults": algo_defaults,
+    }
+
+    contract_json = json.dumps(contract, sort_keys=True)
+    return hashlib.sha256(contract_json.encode()).hexdigest()[:12]
+
+
+CACHE_VERSION = _compute_cache_fingerprint()
 
 
 class CacheManager:
@@ -63,27 +132,11 @@ class CacheManager:
         """Create the cache schema and tables if they don't already exist."""
         self._run_sql(f"CREATE SCHEMA IF NOT EXISTS {CACHE_SCHEMA}")
 
-        self._run_sql(f"""
-            CREATE TABLE IF NOT EXISTS {CACHE_SCHEMA}.cache_metadata (
-                scan_id          INT,
-                cache_version    STRING,
-                cached_at        TIMESTAMP,
-                scan_result_json STRING
+        for table_name, col_ddl in _TABLE_DDLS.items():
+            self._run_sql(
+                f"CREATE TABLE IF NOT EXISTS "
+                f"{CACHE_SCHEMA}.{table_name} ({col_ddl})"
             )
-        """)
-
-        self._run_sql(f"""
-            CREATE TABLE IF NOT EXISTS {CACHE_SCHEMA}.duplicate_groups (
-                scan_id          INT,
-                group_id         INT,
-                label            STRING,
-                tables_json      STRING,
-                pairs_json       STRING,
-                gold_standard    STRING,
-                gold_scores_json STRING,
-                tags_json        STRING
-            )
-        """)
 
     # ── Scan ID management ────────────────────────────────────────────────
 

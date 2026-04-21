@@ -9,8 +9,9 @@ A Databricks App that scans Unity Catalog metadata across all accessible catalog
 | **Multi-Catalog Scanner** | Background scan of every accessible catalog with live progress polling — schemas, tables, columns, types, comments, timestamps, and permissions. Per-catalog breakdowns shown on the dashboard. |
 | **Result Caching** | Scan results and duplicate groups are cached in `catalog_40_copper_uc_metadata.cache`. On startup the app loads from cache instantly; a fresh scan is triggered automatically if the cache is older than 7 days or the cache schema version has changed. |
 | **Permissions Viewer** | Shows which groups and users have READ / WRITE access to each table via metadata snapshot tables — no `MANAGE` privilege needed. Permissions are merged across catalog, schema, and table grant levels. |
-| **Duplicate Detection** | Clusters tables that represent the same entity using column-name Jaccard similarity, type compatibility, and fuzzy table-name matching. Uses a normalised-name grouping pre-filter for scalable comparison (~100K candidates from 143K tables). Groups are labelled by common entity name. |
-| **Gold Standard Scoring** | Ranks each table in a duplicate group on column completeness and freshness to recommend the canonical dataset. |
+| **Duplicate Detection** | Clusters tables that represent the same entity using four similarity signals: column-name Jaccard, type compatibility, fuzzy table-name matching, and Unity Catalog table lineage (shared upstream sources / direct data flow). Uses a normalised-name grouping pre-filter for scalable comparison (\~100K candidates from 143K tables). Groups are labelled by common entity name. |
+| **Lineage Integration** | Loads the last 90 days of `system.access.table_lineage` (via snapshot) to identify tables that share upstream sources or directly feed each other. Enhances duplicate scoring, pipeline-stage tagging, and gold-standard ranking. |
+| **Gold Standard Scoring** | Ranks each table in a duplicate group on column completeness, freshness, downstream consumer count, and upstream position to recommend the canonical dataset. |
 | **Table Comparison** | Side-by-side column diff and permissions diff for any two tables. |
 
 ## Architecture
@@ -80,15 +81,16 @@ uc-duplicate-data-detector/
 
 ### Metadata source
 
-All metadata is read from **snapshot tables** in `catalog_40_copper_uc_metadata.metadata` — weekly CTAS copies of `system.information_schema` tables (catalogs, schemata, tables, columns, catalog_privileges, schema_privileges, table_privileges). These snapshots provide definer-rights access so the app's service principal can read metadata across all catalogs without `MANAGE` privileges.
+All metadata is read from **snapshot tables** in `catalog_40_copper_uc_metadata.metadata` — weekly CTAS copies of `system.information_schema` tables (catalogs, schemata, tables, columns, catalog_privileges, schema_privileges, table_privileges) plus `system.access.table_lineage` and `system.access.column_lineage`. These snapshots provide definer-rights access so the app's service principal can read metadata across all catalogs without `MANAGE` privileges.
 
 ### Scan flow
 
 1. **POST /api/catalog/scan-all** launches a background thread that queries each catalog sequentially (schemas, tables, columns, and three privilege levels).
 2. The frontend polls **GET /api/catalog/scan-status** every 2 seconds with progress updates ("Scanning catalog_name (3/7)…").
-3. After the scan, **duplicate detection** runs in the same background thread using a normalised-name pre-filter and composite similarity scoring.
-4. Results are written to the **UC cache** (`catalog_40_copper_uc_metadata.cache`) so the next app restart loads instantly.
-5. The SQL Statement API uses `EXTERNAL_LINKS` disposition to handle result sets exceeding the 25 MB inline limit.
+3. **Table lineage** is loaded from the `metadata.table_lineage` snapshot (last 90 days): distinct source→target edges and per-table consumer counts.
+4. **Duplicate detection** runs in the same background thread using a normalised-name pre-filter and four-component composite similarity scoring (columns, types, names, lineage).
+5. Results are written to the **UC cache** (`catalog_40_copper_uc_metadata.cache`) so the next app restart loads instantly.
+6. The SQL Statement API uses `EXTERNAL_LINKS` disposition to handle result sets exceeding the 25 MB inline limit.
 
 ### Cache layer
 
@@ -111,10 +113,11 @@ On startup the frontend calls `GET /api/catalog/cache-status`. If valid, `POST /
 
 Groups are automatically tagged during detection:
 
-| Tag | Condition | Default |
+| Tag | Detection method | Default |
 |---|---|---|
-| `governance_view` | 2-table group where one is a VIEW with columns that are a subset of the paired TABLE | Hidden |
-| `pipeline_stage` | All tables in the group are in medallion catalogs (gold/silver/bronze) spanning 2+ tiers | Hidden |
+| `governance_view` | 2-table group where a VIEW's columns are a subset of the paired TABLE | Hidden |
+| `pipeline_stage` | **Lineage-first**: any table in the group directly feeds another member (confirmed via `table_lineage`). **Fallback**: all tables in medallion catalogs (gold/silver/bronze) spanning 2+ tiers | Hidden |
+| `shared_source` | All tables in the group share at least one common upstream source table (requires lineage data for every member) | Visible (informational) |
 
 Frontend filters (Duplicates page): two checkboxes for tag-based hiding + a free-text catalog prefix filter. Pagination limits rendering to 50 groups at a time.
 
@@ -316,16 +319,23 @@ Open the `url` from the output in your browser. You must be logged into the work
 
 Edit `server/duplicates.py` — the `detect_duplicates` function accepts:
 
-- `col_weight` (default 0.50) — Jaccard index on canonical column names
-- `type_weight` (default 0.30) — proportion of shared columns with compatible types
-- `name_weight` (default 0.20) — token-based Jaccard on table names
+- `col_weight` (default 0.40) — Jaccard index on canonical column names
+- `type_weight` (default 0.25) — proportion of shared columns with compatible types
+- `name_weight` (default 0.15) — token-based Jaccard on table names
+- `lin_weight` (default 0.20) — lineage similarity (1.0 for direct A→B flow, otherwise Jaccard on upstream source tables)
+
+**Per-pair normalisation:** If neither table in a pair has any lineage data, the lineage weight is redistributed proportionally to the other three components — so those pairs are scored identically to the pre-lineage algorithm. Only pairs where at least one table has lineage entries are scored with the 4-component weights.
 
 ### Gold standard scoring
 
-Each table in a duplicate group is scored on:
+Each table in a duplicate group is scored on (max 40 pts):
 
 - **Column completeness** (10 pts) — tables with more columns score higher
 - **Freshness** (10 pts) — recently updated tables score higher
+- **Consumer count** (10 pts) — tables read by more downstream entities (notebooks, jobs, dashboards, queries) score higher. Based on distinct `entity_id` counts from `table_lineage`. This is the "social proof" signal — the table the organisation actually uses most.
+- **Upstream position** (10 pts) — if this table is an upstream source of other tables in the same group, it scores the full 10. Copies and derived tables score 0.
+
+The consumer count and upstream position factors are only applied when lineage data is available. Without lineage, scoring reverts to the original 20-point scale (completeness + freshness).
 
 ### Synonym mappings
 
@@ -361,6 +371,19 @@ Edit `server/cache.py` to change:
   - Dedicated SP limits blast radius (no other use)
   - Workspace admin cannot modify account-level groups, delete users from the account, access other workspaces, or change Unity Catalog permissions
   - Running as a scheduled job (not app runtime) means the admin credential is never exposed to the app or its users
+- [x] **Compare page lineage section** — When viewing two tables side-by-side, add a "Lineage" panel showing:
+  * Whether one feeds the other (and via what entity type — notebook, job, pipeline)
+  * Their shared upstream sources
+  * Consumer count for each (who reads from them)
+  * Column-level mappings from `column_lineage` showing which source columns map to which target columns
+
+- [x] **Integrate `column_lineage` into duplicate detection** — Currently only `table_lineage` is used. `column_lineage` (source→target column mappings) could:
+  * Confirm that two tables' matching columns actually originate from the same source column (stronger signal than name-matching alone)
+  * Improve the `governance_view` tagger by verifying the view's columns trace back to the paired table
+  * Provide column-level provenance on the Compare page (answering "are these the same data with renamed columns?")
+
+- [x] **Add `shared_source` filter checkbox** — The `shared_source` tag is assigned but has no dedicated hide checkbox in the frontend filter controls. Consider adding one alongside the governance view and pipeline stage filters.
+
 
 ## License
 

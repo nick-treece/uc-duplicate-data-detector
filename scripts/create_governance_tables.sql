@@ -251,3 +251,19 @@ AS SELECT * FROM system.information_schema.table_share_usage;
 CREATE OR REPLACE TABLE storage_credentials
 COMMENT 'Mirror of system.information_schema.storage_credentials (DEPRECATED)'
 AS SELECT * FROM system.information_schema.storage_credentials;
+
+
+-- ============================================================================
+-- Lineage
+-- ============================================================================
+-- Note: These tables are in system.access, not system.information_schema.
+-- The system.access schema must be enabled in your account for these to work.
+-- See: https://learn.microsoft.com/en-us/azure/databricks/admin/system-tables/lineage
+
+CREATE OR REPLACE TABLE table_lineage
+COMMENT 'Mirror of system.access.table_lineage — records read/write events on Unity Catalog tables'
+AS SELECT * FROM system.access.table_lineage;
+
+CREATE OR REPLACE TABLE column_lineage
+COMMENT 'Mirror of system.access.column_lineage — records column-level source-to-target mappings'
+AS SELECT * FROM system.access.column_lineage;
