@@ -113,6 +113,47 @@ def name_similarity(name_a: str, name_b: str) -> float:
     return len(intersection) / len(union)
 
 
+
+# ── Lineage-based similarity ──────────────────────────────────────────
+
+
+def lineage_similarity(
+    table_a: str,
+    table_b: str,
+    upstream_map: dict[str, set[str]],
+    downstream_map: dict[str, set[str]],
+) -> float:
+    """Score lineage relationship between two tables.
+
+    Returns a value between 0.0 and 1.0 based on:
+      - Shared upstream sources (Jaccard on upstream sets)
+      - Direct lineage (one feeds the other → strong signal)
+    """
+    a_lower = table_a.lower()
+    b_lower = table_b.lower()
+
+    # Direct lineage: A→B or B→A
+    a_downstream = downstream_map.get(a_lower, set())
+    b_downstream = downstream_map.get(b_lower, set())
+    if b_lower in a_downstream or a_lower in b_downstream:
+        return 1.0
+
+    # Shared upstream: Jaccard on source tables
+    a_upstream = upstream_map.get(a_lower, set())
+    b_upstream = upstream_map.get(b_lower, set())
+
+    if not a_upstream and not b_upstream:
+        return 0.0
+
+    intersection = a_upstream & b_upstream
+    union = a_upstream | b_upstream
+
+    if not union:
+        return 0.0
+
+    return len(intersection) / len(union)
+
+
 @dataclass
 class DuplicatePair:
     table_a: str
@@ -120,6 +161,7 @@ class DuplicatePair:
     column_similarity: float
     type_similarity: float
     name_similarity: float
+    lineage_similarity: float
     composite_score: float
 
 
@@ -198,8 +240,15 @@ def _get_medallion_tier(catalog_name: str) -> str | None:
 def _tag_governance_views(
     groups: list[DuplicateGroup],
     table_map: dict[str, TableInfo],
+    column_lineage_map: dict | None = None,
 ):
-    """Tag 2-table groups where a VIEW's columns are a subset of the paired TABLE."""
+    """Tag 2-table groups where a VIEW's columns are a subset of the paired TABLE.
+
+    When column_lineage_map is available, also checks whether the view's
+    columns actually trace back to the paired table (stronger confirmation).
+    """
+    col_lineage = column_lineage_map or {}
+
     for group in groups:
         if len(group.tables) != 2:
             continue
@@ -209,32 +258,61 @@ def _tag_governance_views(
         if not ta or not tb:
             continue
 
-        # Identify which is the view and which is the table
         if ta.table_type.upper() == "VIEW" and tb.table_type.upper() != "VIEW":
             view, tbl = ta, tb
         elif tb.table_type.upper() == "VIEW" and ta.table_type.upper() != "VIEW":
             view, tbl = tb, ta
         else:
-            continue  # both views or both tables
+            continue
 
-        # Check if view columns are a subset of the table columns
         view_cols = {_canonical_col(c.name) for c in view.columns}
         tbl_cols = {_canonical_col(c.name) for c in tbl.columns}
-        if view_cols and view_cols <= tbl_cols:
+        if not (view_cols and view_cols <= tbl_cols):
+            continue
+
+        # Column lineage confirmation (if available)
+        lineage_key = (tbl.full_name.lower(), view.full_name.lower())
+        col_mappings = col_lineage.get(lineage_key, [])
+
+        if col_mappings:
+            # Lineage confirms: table feeds the view
+            group.tags.append("governance_view")
+            group.tags.append("lineage_confirmed")
+        else:
+            # No lineage data — fall back to schema-only heuristic
             group.tags.append("governance_view")
 
 
-def _tag_pipeline_stages(groups: list[DuplicateGroup]):
-    """Tag groups that span multiple medallion tiers (gold/silver/bronze only).
+def _tag_pipeline_stages(
+    groups: list[DuplicateGroup],
+    downstream_map: dict[str, set[str]] | None = None,
+):
+    """Tag groups where tables form a pipeline chain.
 
-    Groups are tagged ``pipeline_stage`` only when **every** table in the
-    group belongs to a medallion catalog (contains 'gold', 'silver', or
-    'bronze') **and** the group spans two or more distinct tiers.
+    Two detection methods (lineage-first, heuristic fallback):
 
-    Groups containing any non-medallion catalog are left untagged — these
-    represent potential duplication worth investigating.
+    1. **Lineage**: if any table in the group directly feeds another
+       member, the relationship is a confirmed pipeline stage.
+    2. **Medallion heuristic** (fallback): if every table is in a
+       gold/silver/bronze catalog spanning 2+ tiers.
     """
+    downstream = downstream_map or {}
+
     for group in groups:
+        # ── Lineage-based detection ───────────────────────────────────
+        if downstream:
+            has_direct_edge = False
+            for full_name in group.tables:
+                targets = downstream.get(full_name.lower(), set())
+                other_members = {t.lower() for t in group.tables if t != full_name}
+                if targets & other_members:
+                    has_direct_edge = True
+                    break
+            if has_direct_edge:
+                group.tags.append("pipeline_stage")
+                continue  # skip heuristic — lineage is definitive
+
+        # ── Medallion heuristic (fallback) ────────────────────────────
         tiers: set[str] = set()
         all_medallion = True
 
@@ -251,27 +329,84 @@ def _tag_pipeline_stages(groups: list[DuplicateGroup]):
             group.tags.append("pipeline_stage")
 
 
+def _tag_shared_source(
+    groups: list[DuplicateGroup],
+    upstream_map: dict[str, set[str]] | None = None,
+):
+    """Tag groups where all members trace back to the same upstream table.
+
+    Distinguishes 'independent copies of the same source' from tables
+    that just happen to look similar.  Only applied when lineage data
+    is available and every table in the group has at least one upstream.
+    """
+    if not upstream_map:
+        return
+
+    for group in groups:
+        upstreams_per_table = []
+        for full_name in group.tables:
+            ups = upstream_map.get(full_name.lower(), set())
+            if not ups:
+                break  # can't confirm shared source if any table has no lineage
+            upstreams_per_table.append(ups)
+        else:
+            # All tables have upstream data — check for a common ancestor
+            shared = upstreams_per_table[0]
+            for ups in upstreams_per_table[1:]:
+                shared = shared & ups
+            if shared:
+                group.tags.append("shared_source")
+
+
 def _apply_tags(
     groups: list[DuplicateGroup],
     table_map: dict[str, TableInfo],
+    lineage: dict | None = None,
 ):
     """Run all taggers on the given groups."""
-    _tag_governance_views(groups, table_map)
-    _tag_pipeline_stages(groups)
+    upstream_map = (lineage or {}).get("upstream_map")
+    downstream_map = (lineage or {}).get("downstream_map")
+    column_lineage_map = (lineage or {}).get("column_lineage_map")
+
+    _tag_governance_views(groups, table_map, column_lineage_map=column_lineage_map)
+    _tag_pipeline_stages(groups, downstream_map=downstream_map)
+    _tag_shared_source(groups, upstream_map=upstream_map)
 
 
 def detect_duplicates(
     tables: list[TableInfo],
     threshold: float = 0.5,
-    col_weight: float = 0.50,
-    type_weight: float = 0.30,
-    name_weight: float = 0.20,
+    col_weight: float = 0.40,
+    type_weight: float = 0.25,
+    name_weight: float = 0.15,
+    lin_weight: float = 0.20,
+    lineage: dict | None = None,
 ) -> list[DuplicateGroup]:
     """Find duplicate table groups based on composite similarity.
 
     Uses a name-token pre-filter to avoid O(n²) comparisons at scale.
     Only tables sharing at least one name token are compared.
+
+    The *lineage* dict should contain ``upstream_map``,
+    ``downstream_map``, and ``consumer_counts`` (all keyed by
+    lowercase full table name).  Lineage weight is applied
+    per-pair: if neither table in a pair has lineage data,
+    the lineage weight is redistributed to the other three
+    components so those pairs are scored identically to the
+    pre-lineage algorithm.
     """
+    upstream_map = (lineage or {}).get("upstream_map", {})
+    downstream_map = (lineage or {}).get("downstream_map", {})
+
+    # Pre-compute which tables have any lineage data at all
+    tables_with_lineage = set(upstream_map.keys()) | set(downstream_map.keys())
+
+    # Pre-compute renormalised weights for pairs with no lineage
+    base_total = col_weight + type_weight + name_weight
+    no_lin_cw = col_weight / base_total if base_total else 0.5
+    no_lin_tw = type_weight / base_total if base_total else 0.3
+    no_lin_nw = name_weight / base_total if base_total else 0.2
+
     candidates = _build_candidate_pairs(tables)
     pairs: list[DuplicatePair] = []
 
@@ -287,7 +422,27 @@ def detect_duplicates(
         typ_sim = type_similarity(ta, tb)
         nm_sim = name_similarity(ta.name, tb.name)
 
-        composite = col_sim * col_weight + typ_sim * type_weight + nm_sim * name_weight
+        # Per-pair lineage: only score if at least one table has lineage
+        a_has = ta.full_name.lower() in tables_with_lineage
+        b_has = tb.full_name.lower() in tables_with_lineage
+        pair_has_lineage = a_has or b_has
+
+        lin_sim = 0.0
+        if pair_has_lineage:
+            lin_sim = lineage_similarity(
+                ta.full_name, tb.full_name, upstream_map, downstream_map,
+            )
+
+        # Use full 4-component weights when lineage applies,
+        # otherwise renormalise to 3 components (no penalty)
+        if pair_has_lineage:
+            cw, tw, nw, lw = col_weight, type_weight, name_weight, lin_weight
+        else:
+            cw, tw, nw, lw = no_lin_cw, no_lin_tw, no_lin_nw, 0.0
+
+        composite = (
+            col_sim * cw + typ_sim * tw + nm_sim * nw + lin_sim * lw
+        )
         if composite >= threshold:
             pairs.append(DuplicatePair(
                 table_a=ta.full_name,
@@ -295,6 +450,7 @@ def detect_duplicates(
                 column_similarity=round(col_sim, 3),
                 type_similarity=round(typ_sim, 3),
                 name_similarity=round(nm_sim, 3),
+                lineage_similarity=round(lin_sim, 3),
                 composite_score=round(composite, 3),
             ))
 
@@ -303,13 +459,13 @@ def detect_duplicates(
     table_map = {t.full_name: t for t in tables}
     for group in groups:
         group_tables = [table_map[n] for n in group.tables if n in table_map]
-        scores = score_gold_standard(group_tables)
+        scores = score_gold_standard(group_tables, lineage=lineage)
         group.gold_scores = scores
         if scores:
             group.gold_standard = max(scores, key=scores.get)
 
     # ── Tag groups for filtering ──────────────────────────────────────────
-    _apply_tags(groups, table_map)
+    _apply_tags(groups, table_map, lineage=lineage)
 
     return groups
 
@@ -393,25 +549,33 @@ def _parse_ts(value) -> float:
     return 0.0
 
 
-def score_gold_standard(tables: list[TableInfo]) -> dict[str, float]:
+def score_gold_standard(
+    tables: list[TableInfo],
+    lineage: dict | None = None,
+) -> dict[str, float]:
     """Score each table in a duplicate group for gold-standard recommendation.
 
-    Scoring factors (higher is better):
-      - Column count: more columns \u2192 more complete
-      - Updated recently: more recent \u2192 more maintained
+    Scoring factors (higher is better, each out of 10):
+      - Column completeness: more columns → more complete
+      - Freshness: recently updated → more maintained
+      - Consumer count: more downstream consumers → more canonical
+      - Upstream position: sources score higher than derived copies
     """
+    consumer_counts = (lineage or {}).get("consumer_counts", {})
+    downstream_map = (lineage or {}).get("downstream_map", {})
+
     scores: dict[str, float] = {}
 
     for t in tables:
         s = 0.0
 
-        # Column count: more columns often means more complete
+        # ── Column completeness (0-10) ────────────────────────────────
         all_col_counts = [len(tt.columns) for tt in tables]
         max_cols = max(all_col_counts) if all_col_counts else 1
         if max_cols > 0:
             s += (len(t.columns) / max_cols) * 10
 
-        # Recently updated: prefer tables that are actively maintained
+        # ── Freshness (0-10) ──────────────────────────────────────────
         ts = _parse_ts(t.updated_at)
         if ts > 0:
             all_ts = [_parse_ts(tt.updated_at) for tt in tables]
@@ -424,6 +588,24 @@ def score_gold_standard(tables: list[TableInfo]) -> dict[str, float]:
                     s += ((ts - min_ts) / span) * 10
                 else:
                     s += 10
+
+        # ── Consumer count (0-10) — lineage-enhanced ──────────────────
+        if consumer_counts:
+            my_consumers = consumer_counts.get(t.full_name.lower(), 0)
+            group_consumers = [
+                consumer_counts.get(tt.full_name.lower(), 0) for tt in tables
+            ]
+            max_consumers = max(group_consumers) if group_consumers else 1
+            if max_consumers > 0:
+                s += (my_consumers / max_consumers) * 10
+
+        # ── Upstream position (0-10) — lineage-enhanced ───────────────
+        if downstream_map:
+            other_names = {tt.full_name.lower() for tt in tables if tt != t}
+            my_downstream = downstream_map.get(t.full_name.lower(), set())
+            feeds_group_members = my_downstream & other_names
+            if feeds_group_members:
+                s += 10  # this table is upstream of others in the group
 
         scores[t.full_name] = round(s, 1)
 
