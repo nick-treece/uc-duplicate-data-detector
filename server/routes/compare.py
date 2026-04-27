@@ -39,26 +39,6 @@ def sample(catalog: str, schema: str, table: str):
         result = fetch_sample_data(t.full_name)
         if result is None:
             raise HTTPException(status_code=500, detail="Could not fetch sample data")
-        # Build access trees with group membership
-        try:
-            all_principals = set()
-            for t in [ta, tb]:
-                if hasattr(t, "permissions") and t.permissions:
-                    for p in t.permissions:
-                        principal = p.principal if hasattr(p, "principal") else p.get("principal", "")
-                        all_principals.add(principal)
-
-            group_members = scanner.query_group_members(list(all_principals))
-            result["access_tree_a"] = build_access_tree(ta, group_members)
-            result["access_tree_b"] = build_access_tree(tb, group_members)
-            result["shared_access"] = compute_shared_access(
-                result["access_tree_a"], result["access_tree_b"],
-            )
-        except Exception as access_err:
-            logger.error(f"Access tree failed: {access_err}")
-            result["access_tree_a"] = []
-            result["access_tree_b"] = []
-
         return result
     except HTTPException:
         raise
