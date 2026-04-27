@@ -900,17 +900,96 @@ function renderCompareResult(r) {
     </div>
     ` : ''}
 
-    ${r.lineage && r.lineage.has_lineage ? `
+    ${(r.access_tree_a && r.access_tree_a.length) || (r.access_tree_b && r.access_tree_b.length) ? `
+    <div class="section">
+      <div class="section-title">Access Tree</div>
+
+      ${r.shared_access && r.shared_access.shared_groups.length ? `
+        <div style="margin-bottom:12px;padding:10px 14px;background:var(--accent-soft);border-left:3px solid var(--accent);border-radius:4px;font-size:13px">
+          <strong>${r.shared_access.shared_groups.length} shared group${r.shared_access.shared_groups.length > 1 ? 's' : ''}:</strong>
+          ${r.shared_access.shared_groups.map(g => `<span class="tag tag-accent" style="margin-left:4px">${g}</span>`).join('')}
+          ${r.shared_access.shared_user_count ? ` <span style="color:var(--text-muted);margin-left:8px">(${r.shared_access.shared_user_count} shared users)</span>` : ''}
+        </div>
+      ` : ''}
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div>
+          <div style="font-weight:600;margin-bottom:8px;font-size:13px">${r.table_a.full_name}</div>
+          ${(r.access_tree_a || []).map(p => {
+            const isShared = r.shared_access && r.shared_access.shared_groups.includes(p.principal);
+            return p.type === 'group' ? `
+            <div class="access-group" style="margin-bottom:6px">
+              <div class="access-group-header" onclick="this.parentElement.classList.toggle('expanded')" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:6px 8px;background:${isShared ? 'var(--accent-soft)' : 'var(--bg-card)'};border-radius:6px;font-size:13px;${isShared ? 'border-left:3px solid var(--accent)' : ''}">
+                <span class="access-chevron" style="transition:transform 0.2s;display:inline-block">&#9654;</span>
+                <span style="font-weight:600">${p.principal}</span>
+                ${isShared ? '<span class="tag tag-accent" style="font-size:10px">SHARED</span>' : ''}
+                <span class="tag tag-accent" style="font-size:11px;margin-left:auto">${p.privileges.join(', ')}</span>
+                <span style="color:var(--text-muted);font-size:11px">${p.members.length}</span>
+              </div>
+              <div class="access-group-members" style="display:none;padding:4px 0 4px 24px">
+                ${p.members.map(m => `
+                  <div style="font-size:12px;padding:3px 0;display:flex;gap:8px;align-items:center">
+                    <span style="color:var(--text-muted)">&#8226;</span>
+                    <span>${m.name}</span>
+                    <span style="color:var(--text-muted);font-size:11px">${m.email}</span>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          ` : `
+            <div style="margin-bottom:6px;padding:6px 8px;background:var(--bg-card);border-radius:6px;font-size:13px;display:flex;align-items:center;gap:6px">
+              <span style="color:var(--text-muted)">&#9679;</span>
+              <span>${p.principal}</span>
+              <span class="tag" style="font-size:11px;margin-left:auto">${p.privileges.join(', ')}</span>
+            </div>
+          `}).join('')}
+        </div>
+        <div>
+          <div style="font-weight:600;margin-bottom:8px;font-size:13px">${r.table_b.full_name}</div>
+          ${(r.access_tree_b || []).map(p => {
+            const isShared = r.shared_access && r.shared_access.shared_groups.includes(p.principal);
+            return p.type === 'group' ? `
+            <div class="access-group" style="margin-bottom:6px">
+              <div class="access-group-header" onclick="this.parentElement.classList.toggle('expanded')" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:6px 8px;background:${isShared ? 'var(--accent-soft)' : 'var(--bg-card)'};border-radius:6px;font-size:13px;${isShared ? 'border-left:3px solid var(--accent)' : ''}">
+                <span class="access-chevron" style="transition:transform 0.2s;display:inline-block">&#9654;</span>
+                <span style="font-weight:600">${p.principal}</span>
+                ${isShared ? '<span class="tag tag-accent" style="font-size:10px">SHARED</span>' : ''}
+                <span class="tag tag-accent" style="font-size:11px;margin-left:auto">${p.privileges.join(', ')}</span>
+                <span style="color:var(--text-muted);font-size:11px">${p.members.length}</span>
+              </div>
+              <div class="access-group-members" style="display:none;padding:4px 0 4px 24px">
+                ${p.members.map(m => `
+                  <div style="font-size:12px;padding:3px 0;display:flex;gap:8px;align-items:center">
+                    <span style="color:var(--text-muted)">&#8226;</span>
+                    <span>${m.name}</span>
+                    <span style="color:var(--text-muted);font-size:11px">${m.email}</span>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+          ` : `
+            <div style="margin-bottom:6px;padding:6px 8px;background:var(--bg-card);border-radius:6px;font-size:13px;display:flex;align-items:center;gap:6px">
+              <span style="color:var(--text-muted)">&#9679;</span>
+              <span>${p.principal}</span>
+              <span class="tag" style="font-size:11px;margin-left:auto">${p.privileges.join(', ')}</span>
+            </div>
+          `}).join('')}
+        </div>
+      </div>
+    </div>
+    ` : ''}
+
+${r.lineage && r.lineage.has_lineage ? `
     <div class="section">
       <div class="section-title">Lineage Comparison</div>
 
       <!-- Consumer counts -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
-        <div style="background:var(--bg-secondary);padding:12px;border-radius:8px;text-align:center">
+        <div style="background:var(--bg-card);padding:12px;border-radius:8px;text-align:center">
           <div style="font-size:12px;color:var(--text-muted)">Consumers of A</div>
           <div style="font-size:20px;font-weight:600">${r.lineage.consumer_counts.a}</div>
         </div>
-        <div style="background:var(--bg-secondary);padding:12px;border-radius:8px;text-align:center">
+        <div style="background:var(--bg-card);padding:12px;border-radius:8px;text-align:center">
           <div style="font-size:12px;color:var(--text-muted)">Consumers of B</div>
           <div style="font-size:20px;font-weight:600">${r.lineage.consumer_counts.b}</div>
         </div>
@@ -918,7 +997,7 @@ function renderCompareResult(r) {
 
       <!-- Direct flow banner -->
       ${r.lineage.direct_flow ? `
-        <div style="margin-bottom:16px;padding:10px 14px;background:var(--accent-bg);border-left:3px solid var(--accent);border-radius:4px">
+        <div style="margin-bottom:16px;padding:10px 14px;background:var(--accent-soft);border-left:3px solid var(--accent);border-radius:4px">
           <strong>Direct data flow:</strong> ${r.lineage.direct_flow.source} \u2192 ${r.lineage.direct_flow.target}
           ${r.lineage.direct_flow.entity_types.length ? `<br><span style="color:var(--text-muted);font-size:13px">Via: ${r.lineage.direct_flow.entity_types.join(", ")}</span>` : ""}
         </div>
@@ -940,7 +1019,7 @@ function renderCompareResult(r) {
           <div style="font-weight:600;margin-bottom:8px;font-size:13px">Upstream of A (${r.lineage.upstream_a.length})</div>
           ${r.lineage.upstream_a.length ? `
             <div style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px">
-              ${r.lineage.upstream_a.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all;${r.lineage.shared_upstream.includes(t) ? 'background:var(--accent-bg);border-color:var(--accent)' : ''}">${t}</span>`).join("")}
+              ${r.lineage.upstream_a.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all;${r.lineage.shared_upstream.includes(t) ? 'background:var(--accent-soft) !important;border-color:var(--accent)' : ''}">${t}</span>`).join("")}
             </div>
           ` : `<span style="color:var(--text-muted);font-size:13px">None found</span>`}
         </div>
@@ -948,7 +1027,7 @@ function renderCompareResult(r) {
           <div style="font-weight:600;margin-bottom:8px;font-size:13px">Upstream of B (${r.lineage.upstream_b.length})</div>
           ${r.lineage.upstream_b.length ? `
             <div style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px">
-              ${r.lineage.upstream_b.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all;${r.lineage.shared_upstream.includes(t) ? 'background:var(--accent-bg);border-color:var(--accent)' : ''}">${t}</span>`).join("")}
+              ${r.lineage.upstream_b.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all;${r.lineage.shared_upstream.includes(t) ? 'background:var(--accent-soft) !important;border-color:var(--accent)' : ''}">${t}</span>`).join("")}
             </div>
           ` : `<span style="color:var(--text-muted);font-size:13px">None found</span>`}
         </div>
@@ -959,7 +1038,7 @@ function renderCompareResult(r) {
           <div style="font-weight:600;margin-bottom:8px;font-size:13px">Downstream of A (${r.lineage.downstream_a.length})</div>
           ${r.lineage.downstream_a.length ? `
             <div style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px">
-              ${r.lineage.downstream_a.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all">${t}</span>`).join("")}
+              ${r.lineage.downstream_a.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all;${r.lineage.shared_downstream && r.lineage.shared_downstream.includes(t) ? 'background:var(--accent-soft) !important;border-color:var(--accent)' : ''}">${t}</span>`).join("")}
             </div>
           ` : `<span style="color:var(--text-muted);font-size:13px">None found</span>`}
         </div>
@@ -967,7 +1046,7 @@ function renderCompareResult(r) {
           <div style="font-weight:600;margin-bottom:8px;font-size:13px">Downstream of B (${r.lineage.downstream_b.length})</div>
           ${r.lineage.downstream_b.length ? `
             <div style="max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:3px">
-              ${r.lineage.downstream_b.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all">${t}</span>`).join("")}
+              ${r.lineage.downstream_b.map(t => `<span class="tag" style="font-size:11px;display:block;word-break:break-all;${r.lineage.shared_downstream && r.lineage.shared_downstream.includes(t) ? 'background:var(--accent-soft) !important;border-color:var(--accent)' : ''}">${t}</span>`).join("")}
             </div>
           ` : `<span style="color:var(--text-muted);font-size:13px">None found</span>`}
         </div>

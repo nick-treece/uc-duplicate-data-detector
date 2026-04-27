@@ -143,6 +143,7 @@ def build_lineage_context(
     a_upstream = upstream_map.get(a, set())
     b_upstream = upstream_map.get(b, set())
     shared_upstream = sorted(a_upstream & b_upstream)
+    shared_downstream = sorted(a_downstream & b_downstream)
 
     # Consumer counts
     a_consumers = consumer_counts.get(a, 0)
@@ -179,7 +180,79 @@ def build_lineage_context(
         "upstream_b": upstream_b,
         "downstream_a": downstream_a,
         "downstream_b": downstream_b,
+        "shared_downstream": shared_downstream,
     }
+
+
+def build_access_tree(table_info, group_members: dict) -> list[dict]:
+    """Build an access tree for a table's permissions.
+
+    Returns a list of principal entries, each with:
+      - principal: group or user name
+      - privileges: list of privilege strings
+      - type: "group" or "user"
+      - members: list of {name, email} if type is "group"
+    """
+    tree = []
+    if not hasattr(table_info, "permissions") or not table_info.permissions:
+        return tree
+
+    for perm in table_info.permissions:
+        principal = perm.principal if hasattr(perm, "principal") else perm.get("principal", "")
+        privs = perm.privileges if hasattr(perm, "privileges") else perm.get("privileges", [])
+
+        members = group_members.get(principal, [])
+        is_group = len(members) > 0
+
+        tree.append({
+            "principal": principal,
+            "privileges": privs,
+            "type": "group" if is_group else "user",
+            "members": members,
+        })
+
+    # Sort: groups first, then users
+    tree.sort(key=lambda x: (0 if x["type"] == "group" else 1, x["principal"]))
+    return tree
+
+
+
+def compute_shared_access(tree_a: list[dict], tree_b: list[dict]) -> dict:
+    """Identify shared principals between two access trees.
+
+    Returns:
+      - shared_groups: groups that appear in both trees
+      - shared_users: individual users in shared groups (union of members)
+      - only_a_groups / only_b_groups: groups unique to each table
+    """
+    groups_a = {p["principal"] for p in tree_a if p["type"] == "group"}
+    groups_b = {p["principal"] for p in tree_b if p["type"] == "group"}
+
+    shared = sorted(groups_a & groups_b)
+    only_a = sorted(groups_a - groups_b)
+    only_b = sorted(groups_b - groups_a)
+
+    # Users who appear in shared groups
+    members_a = {}
+    members_b = {}
+    for p in tree_a:
+        if p["type"] == "group":
+            members_a[p["principal"]] = {m["email"] for m in p["members"]}
+    for p in tree_b:
+        if p["type"] == "group":
+            members_b[p["principal"]] = {m["email"] for m in p["members"]}
+
+    shared_users = set()
+    for g in shared:
+        shared_users |= members_a.get(g, set()) & members_b.get(g, set())
+
+    return {
+        "shared_groups": shared,
+        "only_a_groups": only_a,
+        "only_b_groups": only_b,
+        "shared_user_count": len(shared_users),
+    }
+
 
 def fetch_sample_data(full_name: str, limit: int = 10) -> Optional[dict]:
     """Fetch sample rows via SQL warehouse using the SDK's API client."""

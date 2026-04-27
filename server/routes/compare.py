@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from server.scanner import scanner, TableInfo
-from server.comparator import compare_tables, fetch_sample_data, build_lineage_context
+from server.comparator import compare_tables, fetch_sample_data, build_lineage_context, build_access_tree, compute_shared_access
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,26 @@ def sample(catalog: str, schema: str, table: str):
         result = fetch_sample_data(t.full_name)
         if result is None:
             raise HTTPException(status_code=500, detail="Could not fetch sample data")
+        # Build access trees with group membership
+        try:
+            all_principals = set()
+            for t in [ta, tb]:
+                if hasattr(t, "permissions") and t.permissions:
+                    for p in t.permissions:
+                        principal = p.principal if hasattr(p, "principal") else p.get("principal", "")
+                        all_principals.add(principal)
+
+            group_members = scanner.query_group_members(list(all_principals))
+            result["access_tree_a"] = build_access_tree(ta, group_members)
+            result["access_tree_b"] = build_access_tree(tb, group_members)
+            result["shared_access"] = compute_shared_access(
+                result["access_tree_a"], result["access_tree_b"],
+            )
+        except Exception as access_err:
+            logger.error(f"Access tree failed: {access_err}")
+            result["access_tree_a"] = []
+            result["access_tree_b"] = []
+
         return result
     except HTTPException:
         raise
@@ -78,6 +98,23 @@ def compare(cat1: str, schema1: str, table1: str, cat2: str, schema2: str, table
                 "error": str(lineage_err),
             }
 
+        # Build access trees with group membership
+        try:
+            all_principals = set()
+            for t in [ta, tb]:
+                if hasattr(t, "permissions") and t.permissions:
+                    for p in t.permissions:
+                        principal = p.principal if hasattr(p, "principal") else p.get("principal", "")
+                        all_principals.add(principal)
+
+            group_members = scanner.query_group_members(list(all_principals))
+            result["access_tree_a"] = build_access_tree(ta, group_members)
+            result["access_tree_b"] = build_access_tree(tb, group_members)
+        except Exception as access_err:
+            logger.error(f"Access tree failed: {access_err}")
+            result["access_tree_a"] = []
+            result["access_tree_b"] = []
+
         return result
     except HTTPException:
         raise
@@ -111,3 +148,34 @@ def lineage_status():
         "upstream_map_type": type(scanner._upstream_map).__name__ if hasattr(scanner, '_upstream_map') else "missing",
         "sample_upstream": sample_upstream,
     }
+
+
+@router.get("/debug/access-test/{cat1}/{s1}/{t1}/{cat2}/{s2}/{t2}")
+def access_test(cat1: str, s1: str, t1: str, cat2: str, s2: str, t2: str):
+    """Debug: returns raw access tree + shared_access for a pair."""
+    try:
+        ta = _get_table_info(cat1, s1, t1)
+        tb = _get_table_info(cat2, s2, t2)
+
+        all_principals = set()
+        for t in [ta, tb]:
+            if hasattr(t, "permissions") and t.permissions:
+                for p in t.permissions:
+                    principal = p.principal if hasattr(p, "principal") else p.get("principal", "")
+                    all_principals.add(principal)
+
+        group_members = scanner.query_group_members(list(all_principals))
+        tree_a = build_access_tree(ta, group_members)
+        tree_b = build_access_tree(tb, group_members)
+        shared = compute_shared_access(tree_a, tree_b)
+
+        return {
+            "principals_queried": sorted(all_principals),
+            "group_members_found": {k: len(v) for k, v in group_members.items()},
+            "tree_a_summary": [{"p": p["principal"], "type": p["type"], "members": len(p["members"])} for p in tree_a],
+            "tree_b_summary": [{"p": p["principal"], "type": p["type"], "members": len(p["members"])} for p in tree_b],
+            "shared_access": shared,
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}

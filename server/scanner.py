@@ -924,4 +924,37 @@ class CatalogScanner:
         logger.info("Scanner state restored from cache")
 
 
+    def query_group_members(self, group_names: list[str]) -> dict[str, list[dict]]:
+        """Query users_and_groups for members of the given groups.
+
+        Returns {group_name: [{name, email}, ...]} for each group.
+        """
+        if not group_names:
+            return {}
+
+        src = self._METADATA_SOURCE
+        escaped = ", ".join(
+            f"'{g.replace(chr(39), chr(39)+chr(39))}'" for g in group_names
+        )
+
+        rows = self._run_sql(
+            f"SELECT group_name, user_display_name, email "
+            f"FROM {src}.users_and_groups "
+            f"WHERE group_name IN ({escaped}) "
+            f"ORDER BY group_name, user_display_name",
+            quiet=True,
+        )
+
+        members: dict[str, list[dict]] = {}
+        if rows:
+            for row in rows:
+                gname = row[0]
+                if gname not in members:
+                    members[gname] = []
+                members[gname].append({
+                    "name": row[1] or "",
+                    "email": row[2] or "",
+                })
+        return members
+
 scanner = CatalogScanner()

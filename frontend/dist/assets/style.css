@@ -713,3 +713,8 @@ select:focus, input:focus { outline: none; border-color: var(--accent); }
   white-space: nowrap;
   max-width: 100%;
 }
+
+/* Access tree expand/collapse */
+.access-group .access-group-members { display: none !important; }
+.access-group.expanded .access-group-members { display: block !important; }
+.access-group.expanded .access-chevron { transform: rotate(90deg); }
