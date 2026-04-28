@@ -1052,6 +1052,23 @@ ${r.lineage && r.lineage.has_lineage ? `
         </div>
       </div>
 
+
+      <!-- Shared ancestors (deep/transitive) -->
+      ${r.lineage.shared_ancestors && r.lineage.shared_ancestors.length ? `
+        <div style="margin-bottom:16px">
+          <strong>Shared ancestors (${r.lineage.shared_ancestors.length} common sources across pipeline):</strong>
+          <div style="margin-top:6px;max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:4px">
+            ${r.lineage.shared_ancestors.map(a => `
+              <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--accent-soft);border-left:3px solid var(--accent);border-radius:4px;font-size:12px">
+                <span style="flex:1;word-break:break-all;font-weight:500">${a.name}</span>
+                <span class="tag tag-accent" style="flex-shrink:0">depth A: ${a.depth_a}</span>
+                <span class="tag tag-accent" style="flex-shrink:0">depth B: ${a.depth_b}</span>
+              </div>
+            `).join("")}
+          </div>
+        </div>
+      ` : ""}
+
       <!-- Column-level lineage -->
       ${r.lineage.column_mappings.length ? `
         <div>

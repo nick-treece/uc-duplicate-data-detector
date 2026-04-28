@@ -67,6 +67,7 @@ def compare(cat1: str, schema1: str, table1: str, cat2: str, schema2: str, table
                 consumer_counts=scanner._consumer_counts,
                 column_mappings=col_mappings,
                 lineage_edges=scanner._lineage_edges,
+                transitive_upstream=scanner._transitive_upstream,
             )
             result["lineage"] = lineage_ctx
         except Exception as lineage_err:
@@ -119,12 +120,17 @@ def lineage_status():
         for k, v in list(scanner._upstream_map.items())[:5]:
             sample_upstream[k] = sorted(v)[:3]
 
+    transitive_size = len(scanner._transitive_upstream) if hasattr(scanner, '_transitive_upstream') else -1
+    transitive_entries = sum(len(v) for v in scanner._transitive_upstream.values()) if hasattr(scanner, '_transitive_upstream') and scanner._transitive_upstream else 0
+
     return {
         "is_scanned": scanner.is_scanned,
         "upstream_map_size": upstream_size,
         "downstream_map_size": downstream_size,
         "lineage_edges_size": edges_size,
         "consumer_counts_size": consumers_size,
+        "transitive_upstream_tables": transitive_size,
+        "transitive_upstream_entries": transitive_entries,
         "upstream_map_type": type(scanner._upstream_map).__name__ if hasattr(scanner, '_upstream_map') else "missing",
         "sample_upstream": sample_upstream,
     }

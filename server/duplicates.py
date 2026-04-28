@@ -122,12 +122,14 @@ def lineage_similarity(
     table_b: str,
     upstream_map: dict[str, set[str]],
     downstream_map: dict[str, set[str]],
+    transitive_upstream: dict[str, dict[str, int]] | None = None,
 ) -> float:
     """Score lineage relationship between two tables.
 
     Returns a value between 0.0 and 1.0 based on:
-      - Shared upstream sources (Jaccard on upstream sets)
-      - Direct lineage (one feeds the other → strong signal)
+      - Direct lineage (one feeds the other → 1.0)
+      - Shared transitive ancestors weighted by depth (if available)
+      - Fallback: single-hop shared upstream Jaccard
     """
     a_lower = table_a.lower()
     b_lower = table_b.lower()
@@ -138,7 +140,35 @@ def lineage_similarity(
     if b_lower in a_downstream or a_lower in b_downstream:
         return 1.0
 
-    # Shared upstream: Jaccard on source tables
+    # Transitive ancestor scoring (depth-weighted)
+    if transitive_upstream:
+        a_ancestors = transitive_upstream.get(a_lower, {})
+        b_ancestors = transitive_upstream.get(b_lower, {})
+
+        if a_ancestors or b_ancestors:
+            shared_keys = set(a_ancestors.keys()) & set(b_ancestors.keys())
+            if shared_keys:
+                # Weight closer ancestors higher: 1/depth
+                weighted_score = sum(
+                    1.0 / max(a_ancestors[k], b_ancestors[k])
+                    for k in shared_keys
+                )
+                # Normalise against the smaller ancestor set
+                all_keys = set(a_ancestors.keys()) | set(b_ancestors.keys())
+                max_possible = sum(
+                    1.0 / min(
+                        a_ancestors.get(k, 999),
+                        b_ancestors.get(k, 999),
+                    )
+                    for k in all_keys
+                )
+                if max_possible > 0:
+                    return min(weighted_score / max_possible, 1.0)
+            # Both have ancestors but no overlap
+            if a_ancestors and b_ancestors:
+                return 0.0
+
+    # Fallback: single-hop Jaccard
     a_upstream = upstream_map.get(a_lower, set())
     b_upstream = upstream_map.get(b_lower, set())
 
@@ -152,6 +182,7 @@ def lineage_similarity(
         return 0.0
 
     return len(intersection) / len(union)
+
 
 
 @dataclass
@@ -222,6 +253,110 @@ def _build_candidate_pairs(
 
     return candidates
 
+
+
+def _build_lineage_candidate_pairs(
+    tables: list[TableInfo],
+    transitive_upstream: dict[str, dict[str, int]],
+    max_ancestor_fanout: int = 100,
+    min_shared_ratio: float = 0.5,
+    top_n_ancestors: int = 5,
+    max_candidates: int = 200_000,
+) -> set[tuple[int, int]]:
+    """Second candidate-generation pass: pair tables sharing deep ancestors.
+
+    Groups tables by their closest transitive ancestors (depth <= 3 only).
+    If two tables share >50% of their top-5 ancestors, they become candidates
+    regardless of name similarity.
+
+    Guard rails:
+      - Only ancestors at depth <= 3
+      - Skip ancestors appearing in >max_ancestor_fanout tables (hub sources)
+      - Cap total candidates to avoid explosion
+    """
+    from collections import defaultdict
+
+    # Step 1: Count how many tables each ancestor appears in (for hub filtering)
+    ancestor_frequency: dict[str, int] = defaultdict(int)
+    for table_ancestors in transitive_upstream.values():
+        for anc, depth in table_ancestors.items():
+            if depth <= 3:
+                ancestor_frequency[anc] += 1
+
+    # Step 2: For each table, compute its "ancestor signature" (top-N closest, non-hub)
+    table_index = {t.full_name.lower(): i for i, t in enumerate(tables)}
+    signatures: dict[int, tuple[str, ...]] = {}
+
+    for i, t in enumerate(tables):
+        key = t.full_name.lower()
+        ancestors = transitive_upstream.get(key, {})
+        if not ancestors:
+            continue
+
+        # Filter: depth <= 3, skip hubs
+        filtered = [
+            (anc, depth) for anc, depth in ancestors.items()
+            if depth <= 3 and ancestor_frequency[anc] <= max_ancestor_fanout
+        ]
+        if not filtered:
+            continue
+
+        # Take top-N closest ancestors (sorted by depth, then name for stability)
+        filtered.sort(key=lambda x: (x[1], x[0]))
+        top = tuple(anc for anc, _ in filtered[:top_n_ancestors])
+        signatures[i] = top
+
+    # Step 3: Inverted index — map each ancestor to the tables that have it in their signature
+    ancestor_to_tables: dict[str, list[int]] = defaultdict(list)
+    for idx, sig in signatures.items():
+        for anc in sig:
+            ancestor_to_tables[anc].append(idx)
+
+    # Step 4: Find pairs sharing enough ancestors
+    candidates: set[tuple[int, int]] = set()
+    seen_pairs: set[tuple[int, int]] = set()
+
+    for idx_a, sig_a in signatures.items():
+        if len(candidates) >= max_candidates:
+            break
+
+        # Collect all tables that share at least one ancestor with idx_a
+        neighbour_counts: dict[int, int] = defaultdict(int)
+        for anc in sig_a:
+            for idx_b in ancestor_to_tables[anc]:
+                if idx_b != idx_a:
+                    neighbour_counts[idx_b] += 1
+
+        sig_a_len = len(sig_a)
+        for idx_b, shared_count in neighbour_counts.items():
+            pair_key = (min(idx_a, idx_b), max(idx_a, idx_b))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            # Check ratio against the smaller signature
+            sig_b = signatures.get(idx_b)
+            if not sig_b:
+                continue
+            min_sig_len = min(sig_a_len, len(sig_b))
+            if min_sig_len == 0:
+                continue
+
+            ratio = shared_count / min_sig_len
+            if ratio < min_shared_ratio:
+                continue
+
+            # Only cross-catalog/schema pairs
+            ta, tb = tables[idx_a], tables[idx_b]
+            if ta.catalog == tb.catalog and ta.schema == tb.schema:
+                continue
+
+            candidates.add(pair_key)
+
+            if len(candidates) % 10000 == 0:
+                time.sleep(0)
+
+    return candidates
 
 # ── Group tagging ─────────────────────────────────────────────────────────
 
@@ -397,6 +532,7 @@ def detect_duplicates(
     """
     upstream_map = (lineage or {}).get("upstream_map", {})
     downstream_map = (lineage or {}).get("downstream_map", {})
+    transitive_upstream = (lineage or {}).get("transitive_upstream", {})
 
     # Pre-compute which tables have any lineage data at all
     tables_with_lineage = set(upstream_map.keys()) | set(downstream_map.keys())
@@ -408,6 +544,14 @@ def detect_duplicates(
     no_lin_nw = name_weight / base_total if base_total else 0.2
 
     candidates = _build_candidate_pairs(tables)
+
+    # Enhancement 2: add lineage-based candidates (different names, shared ancestors)
+    if transitive_upstream:
+        lineage_candidates = _build_lineage_candidate_pairs(
+            tables, transitive_upstream
+        )
+        candidates = candidates | lineage_candidates
+
     pairs: list[DuplicatePair] = []
 
     for i, (a, b) in enumerate(candidates):
@@ -431,6 +575,7 @@ def detect_duplicates(
         if pair_has_lineage:
             lin_sim = lineage_similarity(
                 ta.full_name, tb.full_name, upstream_map, downstream_map,
+                transitive_upstream=transitive_upstream,
             )
 
         # Use full 4-component weights when lineage applies,

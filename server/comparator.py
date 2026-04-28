@@ -110,6 +110,7 @@ def build_lineage_context(
     consumer_counts: dict,
     column_mappings: list,
     lineage_edges: list,
+    transitive_upstream: dict | None = None,
 ) -> dict:
     """Build lineage context for the compare page between two tables."""
     a = table_a_name.lower()
@@ -162,8 +163,21 @@ def build_lineage_context(
     downstream_a = sorted(a_downstream)
     downstream_b = sorted(b_downstream)
 
+    # Deep shared ancestors (transitive)
+    shared_ancestors = []
+    trans = transitive_upstream or {}
+    a_ancestors = trans.get(a, {})
+    b_ancestors = trans.get(b, {})
+    shared_ancestor_keys = set(a_ancestors.keys()) & set(b_ancestors.keys())
+    for anc in sorted(shared_ancestor_keys, key=lambda k: min(a_ancestors[k], b_ancestors[k])):
+        shared_ancestors.append({
+            "name": anc,
+            "depth_a": a_ancestors[anc],
+            "depth_b": b_ancestors[anc],
+        })
+
     has_lineage = bool(
-        direct_flow or shared_upstream
+        direct_flow or shared_upstream or shared_ancestors
         or a_consumers or b_consumers
         or col_mappings
         or upstream_a or upstream_b
@@ -181,6 +195,7 @@ def build_lineage_context(
         "downstream_a": downstream_a,
         "downstream_b": downstream_b,
         "shared_downstream": shared_downstream,
+        "shared_ancestors": shared_ancestors,
     }
 
 
