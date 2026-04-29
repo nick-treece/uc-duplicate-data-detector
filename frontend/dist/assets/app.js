@@ -806,6 +806,7 @@ function refreshPickers() {
 
 // ===== Compare =====
 async function renderCompare() {
+  _lineageGraphLoaded = false;
   const params = new URLSearchParams(location.hash.split('?')[1] || '');
   const c1 = params.get('c1'), s1 = params.get('s1'), t1 = params.get('t1');
   const c2 = params.get('c2'), s2 = params.get('s2'), t2 = params.get('t2');
@@ -837,6 +838,10 @@ async function renderCompare() {
 }
 
 async function doCompare() {
+  _lineageGraphLoaded = false;
+  const graphContainer = document.getElementById('lineage-graph-container');
+  if (graphContainer) graphContainer.style.display = 'none';
+
   const { cat: c1, sch: s1, tbl: t1 } = _pickA;
   const { cat: c2, sch: s2, tbl: t2 } = _pickB;
   if (!c1 || !s1 || !t1 || !c2 || !s2 || !t2) { alert('Select two tables'); return; }
@@ -1069,6 +1074,28 @@ ${r.lineage && r.lineage.has_lineage ? `
         </div>
       ` : ""}
 
+
+      <!-- Lineage Graph (Enhancement 3) -->
+      <div style="margin-top:16px">
+        <div style="cursor:pointer;user-select:none;font-weight:600;font-size:13px;padding:8px 0" onclick="toggleLineageGraph(this)">
+          &#9654; Lineage Graph <span style="font-size:12px;color:var(--text-muted)">(click to expand)</span>
+        </div>
+        <div id="lineage-graph-container" style="display:none">
+          <div id="lineage-graph-loading" style="text-align:center;padding:20px;color:var(--text-muted)">Loading graph...</div>
+          <div id="lineage-graph-legend" style="display:none;padding:8px 12px;margin-bottom:8px;font-size:11px;color:var(--text-muted);border:1px solid var(--border);border-radius:6px;background:var(--bg-secondary)">
+            <span style="margin-right:16px"><span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:#1e40af;border:1.5px solid #3b82f6;vertical-align:middle;margin-right:4px"></span> Compared tables</span>
+            <span style="margin-right:16px"><span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:#7c3aed;border:1.5px solid #a78bfa;vertical-align:middle;margin-right:4px"></span> Shared ancestor</span>
+            <span style="margin-right:16px"><span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:#1e293b;border:1.5px solid #475569;vertical-align:middle;margin-right:4px"></span> Intermediate</span>
+            <span style="margin-left:12px;border-left:1px solid var(--border);padding-left:12px">Tier dots:</span>
+            <span style="margin-left:8px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f59e0b;vertical-align:middle;margin-right:3px"></span>gold</span>
+            <span style="margin-left:8px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#94a3b8;vertical-align:middle;margin-right:3px"></span>silver</span>
+            <span style="margin-left:8px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#d97706;vertical-align:middle;margin-right:3px"></span>bronze</span>
+            <span style="margin-left:8px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#b45309;vertical-align:middle;margin-right:3px"></span>copper</span>
+          </div>
+          <div id="lineage-graph-svg" style="width:100%;height:500px;overflow:hidden;border:1px solid var(--border);border-radius:8px;background:var(--bg-secondary)"></div>
+        </div>
+      </div>
+
       <!-- Column-level lineage -->
       ${r.lineage.column_mappings.length ? `
         <div>
@@ -1133,4 +1160,188 @@ function renderSampleTable(data) {
       </table>
     </div>
   `;
+}
+
+
+// ── Enhancement 3: Lineage Graph (D3 + dagre) ────────────────────────────
+
+let _lineageGraphLoaded = false;
+
+function toggleLineageGraph(el) {
+  const container = document.getElementById('lineage-graph-container');
+  if (!container) return;
+
+  const isHidden = container.style.display === 'none';
+  container.style.display = isHidden ? 'block' : 'none';
+  // Update the arrow character in the toggle text
+  el.innerHTML = el.innerHTML.replace(isHidden ? '\u25b6' : '\u25bc', isHidden ? '\u25bc' : '\u25b6');
+
+  if (isHidden && !_lineageGraphLoaded) {
+    _lineageGraphLoaded = true;
+    loadLineageGraph();
+  }
+}
+
+async function loadLineageGraph() {
+  const cat1 = _pickA.cat, s1 = _pickA.sch, t1 = _pickA.tbl;
+  const cat2 = _pickB.cat, s2 = _pickB.sch, t2 = _pickB.tbl;
+
+  const loading = document.getElementById('lineage-graph-loading');
+  const svgContainer = document.getElementById('lineage-graph-svg');
+
+  if (!cat1 || !s1 || !t1 || !cat2 || !s2 || !t2) {
+    if (loading) loading.innerHTML = '<span style="color:var(--red)">Cannot load graph: no tables selected</span>';
+    return;
+  }
+
+  // Check CDN dependencies loaded
+  if (typeof d3 === 'undefined' || typeof dagre === 'undefined') {
+    if (loading) loading.innerHTML = '<span style="color:var(--red)">Graph libraries (D3/dagre) failed to load. Check browser console.</span>';
+    return;
+  }
+
+  try {
+    const resp = await fetch(`/api/compare/lineage-graph/${cat1}/${s1}/${t1}/${cat2}/${s2}/${t2}`);
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.detail || errData.error || `HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+
+    if (loading) loading.style.display = 'none';
+
+    if (!data.nodes || data.nodes.length === 0) {
+      svgContainer.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No connecting lineage path found between these tables.</div>';
+      return;
+    }
+
+    renderDagreGraph(svgContainer, data);
+    const legendEl = document.getElementById('lineage-graph-legend');
+    if (legendEl) legendEl.style.display = 'block';
+  } catch (err) {
+    if (loading) loading.style.display = 'none';
+    svgContainer.innerHTML = `<div style="text-align:center;padding:40px;color:var(--red)">Failed to load graph: ${err.message}</div>`;
+  }
+}
+
+function renderDagreGraph(container, data) {
+  const width = container.clientWidth || 900;
+  const height = 500;
+
+  // Tier colours
+  const tierColors = {
+    gold: '#f59e0b',
+    silver: '#94a3b8',
+    bronze: '#d97706',
+    copper: '#b45309',
+    unknown: '#6366f1'
+  };
+
+  // Create dagre graph
+  const g = new dagre.graphlib.Graph();
+  g.setGraph({ rankdir: 'LR', nodesep: 40, ranksep: 80, marginx: 30, marginy: 20 });
+  g.setDefaultEdgeLabel(() => ({}));
+
+  // Add nodes
+  data.nodes.forEach(n => {
+    const labelLines = n.label.split('.');
+    const displayLabel = labelLines.length > 1 ? labelLines[labelLines.length - 1] : n.label;
+    g.setNode(n.id, { label: displayLabel, width: Math.min(displayLabel.length * 7 + 20, 200), height: 36 });
+  });
+
+  // Add edges
+  data.edges.forEach(e => {
+    g.setEdge(e.source, e.target);
+  });
+
+  // Compute layout
+  dagre.layout(g);
+
+  // Get graph dimensions
+  const graphWidth = g.graph().width || width;
+  const graphHeight = g.graph().height || height;
+
+  // Create SVG
+  container.innerHTML = '';
+  const svg = d3.select(container).append('svg')
+    .attr('width', '100%')
+    .attr('height', height)
+    .attr('viewBox', `0 0 ${graphWidth + 60} ${graphHeight + 40}`)
+    .attr('preserveAspectRatio', 'xMidYMid meet');
+
+  const root = svg.append('g').attr('transform', 'translate(30, 20)');
+
+  // Zoom/pan
+  const zoom = d3.zoom()
+    .scaleExtent([0.3, 8])
+    .on('zoom', (event) => root.attr('transform', event.transform));
+  svg.call(zoom);
+
+  // Draw edges (arrows)
+  root.append('defs').append('marker')
+    .attr('id', 'arrowhead')
+    .attr('viewBox', '0 0 10 10')
+    .attr('refX', 8).attr('refY', 5)
+    .attr('markerWidth', 6).attr('markerHeight', 6)
+    .attr('orient', 'auto')
+    .append('path').attr('d', 'M0,0 L10,5 L0,10 Z')
+    .attr('fill', '#64748b');
+
+  g.edges().forEach(e => {
+    const edge = g.edge(e);
+    const line = d3.line().x(p => p.x).y(p => p.y).curve(d3.curveBasis);
+    root.append('path')
+      .attr('d', line(edge.points))
+      .attr('fill', 'none')
+      .attr('stroke', '#64748b')
+      .attr('stroke-width', 1.5)
+      .attr('marker-end', 'url(#arrowhead)');
+  });
+
+  // Node lookup for data
+  const nodeMap = {};
+  data.nodes.forEach(n => { nodeMap[n.id] = n; });
+
+  // Draw nodes
+  g.nodes().forEach(nodeId => {
+    const node = g.node(nodeId);
+    const nodeData = nodeMap[nodeId];
+    if (!node || !nodeData) return;
+
+    const group = root.append('g')
+      .attr('transform', `translate(${node.x - node.width/2}, ${node.y - node.height/2})`)
+      .style('cursor', 'pointer');
+
+    // Background rect
+    const fillColor = nodeData.is_target ? '#1e40af' : nodeData.is_shared_ancestor ? '#7c3aed' : '#1e293b';
+    const strokeColor = nodeData.is_target ? '#3b82f6' : nodeData.is_shared_ancestor ? '#a78bfa' : tierColors[nodeData.tier] || '#475569';
+
+    group.append('rect')
+      .attr('width', node.width)
+      .attr('height', node.height)
+      .attr('rx', 6)
+      .attr('fill', fillColor)
+      .attr('stroke', strokeColor)
+      .attr('stroke-width', nodeData.is_target ? 2.5 : 1.5);
+
+    // Tier indicator dot
+    group.append('circle')
+      .attr('cx', 10).attr('cy', node.height / 2)
+      .attr('r', 4)
+      .attr('fill', tierColors[nodeData.tier] || '#475569');
+
+    // Label text
+    const displayLabel = node.label.length > 25 ? node.label.substring(0, 23) + '...' : node.label;
+    group.append('text')
+      .attr('x', 20).attr('y', node.height / 2 + 4)
+      .attr('fill', '#e2e8f0')
+      .attr('font-size', '11px')
+      .attr('font-family', 'monospace')
+      .text(displayLabel);
+
+    // Tooltip on hover
+    group.append('title')
+      .text(`${nodeData.id}\nTier: ${nodeData.tier}\nConsumers: ${nodeData.consumers}${nodeData.depth_from_a != null ? '\nDepth from A: ' + nodeData.depth_from_a : ''}${nodeData.depth_from_b != null ? '\nDepth from B: ' + nodeData.depth_from_b : ''}`);
+  });
+
 }

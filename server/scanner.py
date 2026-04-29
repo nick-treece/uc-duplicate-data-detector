@@ -289,8 +289,8 @@ class CatalogScanner:
             if not quiet:
                 self._add_error(msg)
         except Exception as e:
-            msg = f"SQL exception: {e}"
-            logger.warning(f"{msg} [query: {sql_preview}...]")
+            msg = f"SQL exception ({type(e).__name__}): {e} [query: {sql_preview[:80]}]"
+            logger.warning(msg)
             if not quiet:
                 self._add_error(msg)
         return None
