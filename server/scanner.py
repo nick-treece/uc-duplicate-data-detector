@@ -222,7 +222,13 @@ class CatalogScanner:
                     "column_lineage_map": self._column_lineage_map,
                     "transitive_upstream": self._transitive_upstream,
                 }
-                groups = detect_duplicates(self._tables, lineage=lineage_ctx)
+                def _detection_progress(msg, done, total):
+                    if total > 0:
+                        self._update_status(message=f"{msg} ({done:,}/{total:,})")
+                    else:
+                        self._update_status(message=msg)
+
+                groups = detect_duplicates(self._tables, lineage=lineage_ctx, progress_fn=_detection_progress)
                 self._duplicate_groups = [g.to_dict() for g in groups]
                 result["groups_count"] = len(self._duplicate_groups)
                 logger.info(f"Detected {len(self._duplicate_groups)} duplicate groups")
@@ -666,7 +672,13 @@ class CatalogScanner:
             }
 
             self._update_status(message=f"Comparing tables\u2026")
-            groups = detect_duplicates(self._tables, threshold=threshold, lineage=lineage_ctx)
+            def _detection_progress(msg, done, total):
+                if total > 0:
+                    self._update_status(message=f"{msg} ({done:,}/{total:,})")
+                else:
+                    self._update_status(message=msg)
+
+            groups = detect_duplicates(self._tables, threshold=threshold, lineage=lineage_ctx, progress_fn=_detection_progress)
             self._duplicate_groups = [g.to_dict() for g in groups]
 
             elapsed = int(time.time() - t0)

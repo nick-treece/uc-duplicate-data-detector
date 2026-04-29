@@ -8,6 +8,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from itertools import combinations
+from typing import Callable
 
 from server.scanner import TableInfo
 
@@ -114,7 +115,7 @@ def name_similarity(name_a: str, name_b: str) -> float:
 
 
 
-# ── Lineage-based similarity ──────────────────────────────────────────
+# ── Lineage-based similarity ──────────────────────────────────────
 
 
 def lineage_similarity(
@@ -123,6 +124,9 @@ def lineage_similarity(
     upstream_map: dict[str, set[str]],
     downstream_map: dict[str, set[str]],
     transitive_upstream: dict[str, dict[str, int]] | None = None,
+    weighted_ancestors: dict[str, dict[str, float]] | None = None,
+    ancestor_keysets: dict[str, frozenset] | None = None,
+    skip_transitive: bool = False,
 ) -> float:
     """Score lineage relationship between two tables.
 
@@ -130,6 +134,11 @@ def lineage_similarity(
       - Direct lineage (one feeds the other → 1.0)
       - Shared transitive ancestors weighted by depth (if available)
       - Fallback: single-hop shared upstream Jaccard
+
+    Performance parameters:
+      - weighted_ancestors: pre-computed {table: {ancestor: 1/depth}} dicts
+      - ancestor_keysets: pre-computed frozensets for fast intersection
+      - skip_transitive: if True, skip expensive transitive scoring (no overlap)
     """
     a_lower = table_a.lower()
     b_lower = table_b.lower()
@@ -140,33 +149,64 @@ def lineage_similarity(
     if b_lower in a_downstream or a_lower in b_downstream:
         return 1.0
 
+    # Short-circuit: caller already checked no overlap
+    if skip_transitive:
+        # Fall through to single-hop Jaccard
+        a_upstream = upstream_map.get(a_lower, set())
+        b_upstream = upstream_map.get(b_lower, set())
+        if not a_upstream and not b_upstream:
+            return 0.0
+        intersection = a_upstream & b_upstream
+        union = a_upstream | b_upstream
+        return len(intersection) / len(union) if union else 0.0
+
     # Transitive ancestor scoring (depth-weighted)
     if transitive_upstream:
-        a_ancestors = transitive_upstream.get(a_lower, {})
-        b_ancestors = transitive_upstream.get(b_lower, {})
+        # Use pre-computed weights if available (avoids per-call 1/depth divisions)
+        if weighted_ancestors:
+            wa = weighted_ancestors.get(a_lower, {})
+            wb = weighted_ancestors.get(b_lower, {})
 
-        if a_ancestors or b_ancestors:
-            shared_keys = set(a_ancestors.keys()) & set(b_ancestors.keys())
-            if shared_keys:
-                # Weight closer ancestors higher: 1/depth
-                weighted_score = sum(
-                    1.0 / max(a_ancestors[k], b_ancestors[k])
-                    for k in shared_keys
-                )
-                # Normalise against the smaller ancestor set
-                all_keys = set(a_ancestors.keys()) | set(b_ancestors.keys())
-                max_possible = sum(
-                    1.0 / min(
-                        a_ancestors.get(k, 999),
-                        b_ancestors.get(k, 999),
+            if wa or wb:
+                # Use pre-computed keysets for fast intersection
+                if ancestor_keysets:
+                    shared_keys = ancestor_keysets.get(a_lower, frozenset()) & ancestor_keysets.get(b_lower, frozenset())
+                else:
+                    shared_keys = set(wa.keys()) & set(wb.keys())
+
+                if shared_keys:
+                    weighted_score = sum(min(wa.get(k, 0), wb.get(k, 0)) for k in shared_keys)
+                    all_keys = set(wa.keys()) | set(wb.keys())
+                    max_possible = sum(max(wa.get(k, 0), wb.get(k, 0)) for k in all_keys)
+                    if max_possible > 0:
+                        return min(weighted_score / max_possible, 1.0)
+                # Both have ancestors but no overlap
+                if wa and wb:
+                    return 0.0
+        else:
+            # Fallback: original unoptimised path
+            a_ancestors = transitive_upstream.get(a_lower, {})
+            b_ancestors = transitive_upstream.get(b_lower, {})
+
+            if a_ancestors or b_ancestors:
+                shared_keys = set(a_ancestors.keys()) & set(b_ancestors.keys())
+                if shared_keys:
+                    weighted_score = sum(
+                        1.0 / max(a_ancestors[k], b_ancestors[k])
+                        for k in shared_keys
                     )
-                    for k in all_keys
-                )
-                if max_possible > 0:
-                    return min(weighted_score / max_possible, 1.0)
-            # Both have ancestors but no overlap
-            if a_ancestors and b_ancestors:
-                return 0.0
+                    all_keys = set(a_ancestors.keys()) | set(b_ancestors.keys())
+                    max_possible = sum(
+                        1.0 / min(
+                            a_ancestors.get(k, 999),
+                            b_ancestors.get(k, 999),
+                        )
+                        for k in all_keys
+                    )
+                    if max_possible > 0:
+                        return min(weighted_score / max_possible, 1.0)
+                if a_ancestors and b_ancestors:
+                    return 0.0
 
     # Fallback: single-hop Jaccard
     a_upstream = upstream_map.get(a_lower, set())
@@ -229,7 +269,7 @@ def _build_candidate_pairs(
     candidates.  Groups larger than *max_group_size* are skipped.
 
     This is dramatically faster than the single-token inverted-index
-    approach at scale (\u223c100K candidates vs \u223c15M).
+    approach at scale (∼100K candidates vs ∼15M).
     """
     from collections import defaultdict
 
@@ -358,7 +398,7 @@ def _build_lineage_candidate_pairs(
 
     return candidates
 
-# ── Group tagging ─────────────────────────────────────────────────────────
+# ── Group tagging ─────────────────────────────────────────────────────
 
 _MEDALLION_KEYWORDS = {"gold", "silver", "bronze"}
 
@@ -377,11 +417,7 @@ def _tag_governance_views(
     table_map: dict[str, TableInfo],
     column_lineage_map: dict | None = None,
 ):
-    """Tag 2-table groups where a VIEW's columns are a subset of the paired TABLE.
-
-    When column_lineage_map is available, also checks whether the view's
-    columns actually trace back to the paired table (stronger confirmation).
-    """
+    """Tag 2-table groups where a VIEW's columns are a subset of the paired TABLE."""
     col_lineage = column_lineage_map or {}
 
     for group in groups:
@@ -405,16 +441,13 @@ def _tag_governance_views(
         if not (view_cols and view_cols <= tbl_cols):
             continue
 
-        # Column lineage confirmation (if available)
         lineage_key = (tbl.full_name.lower(), view.full_name.lower())
         col_mappings = col_lineage.get(lineage_key, [])
 
         if col_mappings:
-            # Lineage confirms: table feeds the view
             group.tags.append("governance_view")
             group.tags.append("lineage_confirmed")
         else:
-            # No lineage data — fall back to schema-only heuristic
             group.tags.append("governance_view")
 
 
@@ -422,19 +455,10 @@ def _tag_pipeline_stages(
     groups: list[DuplicateGroup],
     downstream_map: dict[str, set[str]] | None = None,
 ):
-    """Tag groups where tables form a pipeline chain.
-
-    Two detection methods (lineage-first, heuristic fallback):
-
-    1. **Lineage**: if any table in the group directly feeds another
-       member, the relationship is a confirmed pipeline stage.
-    2. **Medallion heuristic** (fallback): if every table is in a
-       gold/silver/bronze catalog spanning 2+ tiers.
-    """
+    """Tag groups where tables form a pipeline chain."""
     downstream = downstream_map or {}
 
     for group in groups:
-        # ── Lineage-based detection ───────────────────────────────────
         if downstream:
             has_direct_edge = False
             for full_name in group.tables:
@@ -445,9 +469,9 @@ def _tag_pipeline_stages(
                     break
             if has_direct_edge:
                 group.tags.append("pipeline_stage")
-                continue  # skip heuristic — lineage is definitive
+                continue
 
-        # ── Medallion heuristic (fallback) ────────────────────────────
+        # Medallion heuristic (fallback)
         tiers: set[str] = set()
         all_medallion = True
 
@@ -468,12 +492,7 @@ def _tag_shared_source(
     groups: list[DuplicateGroup],
     upstream_map: dict[str, set[str]] | None = None,
 ):
-    """Tag groups where all members trace back to the same upstream table.
-
-    Distinguishes 'independent copies of the same source' from tables
-    that just happen to look similar.  Only applied when lineage data
-    is available and every table in the group has at least one upstream.
-    """
+    """Tag groups where all members trace back to the same upstream table."""
     if not upstream_map:
         return
 
@@ -482,10 +501,9 @@ def _tag_shared_source(
         for full_name in group.tables:
             ups = upstream_map.get(full_name.lower(), set())
             if not ups:
-                break  # can't confirm shared source if any table has no lineage
+                break
             upstreams_per_table.append(ups)
         else:
-            # All tables have upstream data — check for a common ancestor
             shared = upstreams_per_table[0]
             for ups in upstreams_per_table[1:]:
                 shared = shared & ups
@@ -516,19 +534,15 @@ def detect_duplicates(
     name_weight: float = 0.15,
     lin_weight: float = 0.20,
     lineage: dict | None = None,
+    progress_fn: Callable[[str, int, int], None] | None = None,
 ) -> list[DuplicateGroup]:
     """Find duplicate table groups based on composite similarity.
 
     Uses a name-token pre-filter to avoid O(n²) comparisons at scale.
     Only tables sharing at least one name token are compared.
 
-    The *lineage* dict should contain ``upstream_map``,
-    ``downstream_map``, and ``consumer_counts`` (all keyed by
-    lowercase full table name).  Lineage weight is applied
-    per-pair: if neither table in a pair has lineage data,
-    the lineage weight is redistributed to the other three
-    components so those pairs are scored identically to the
-    pre-lineage algorithm.
+    The *progress_fn* callback receives (message, done, total) and is
+    called at each phase boundary and every 1000 pairs during scoring.
     """
     upstream_map = (lineage or {}).get("upstream_map", {})
     downstream_map = (lineage or {}).get("downstream_map", {})
@@ -543,19 +557,56 @@ def detect_duplicates(
     no_lin_tw = type_weight / base_total if base_total else 0.3
     no_lin_nw = name_weight / base_total if base_total else 0.2
 
+    # ── Phase 1: Name-based candidates ──────────────────────────────
+    if progress_fn:
+        progress_fn("Building name-based candidates…", 0, 0)
+
     candidates = _build_candidate_pairs(tables)
 
-    # Enhancement 2: add lineage-based candidates (different names, shared ancestors)
+    if progress_fn:
+        progress_fn(f"Name candidates: {len(candidates):,}", 0, 0)
+
+    # ── Phase 2: Lineage-based candidates ────────────────────────────
     if transitive_upstream:
+        if progress_fn:
+            progress_fn("Building lineage-based candidates…", 0, 0)
+
         lineage_candidates = _build_lineage_candidate_pairs(
             tables, transitive_upstream
         )
         candidates = candidates | lineage_candidates
 
+        if progress_fn:
+            progress_fn(f"Total candidates: {len(candidates):,}", 0, 0)
+
+    # ── Pre-compute for fast lineage scoring ───────────────────────
+    ancestor_keysets: dict[str, frozenset] = {}
+    weighted_ancestors: dict[str, dict[str, float]] = {}
+
+    if transitive_upstream:
+        if progress_fn:
+            progress_fn("Pre-computing lineage indices…", 0, 0)
+
+        ancestor_keysets = {
+            t: frozenset(ancs.keys())
+            for t, ancs in transitive_upstream.items()
+        }
+        weighted_ancestors = {
+            t: {anc: 1.0 / depth for anc, depth in ancs.items()}
+            for t, ancs in transitive_upstream.items()
+        }
+
+    # ── Phase 3: Score all candidate pairs ───────────────────────────
     pairs: list[DuplicatePair] = []
+    total_candidates = len(candidates)
+
+    if progress_fn:
+        progress_fn("Scoring candidates…", 0, total_candidates)
 
     for i, (a, b) in enumerate(candidates):
-        if i % 5000 == 0:
+        if i % 1000 == 0:
+            if progress_fn:
+                progress_fn("Scoring candidates…", i, total_candidates)
             time.sleep(0)  # yield GIL for HTTP threads
 
         ta, tb = tables[a], tables[b]
@@ -573,9 +624,19 @@ def detect_duplicates(
 
         lin_sim = 0.0
         if pair_has_lineage:
+            # Short-circuit: skip expensive transitive calc if no shared ancestors
+            a_lower = ta.full_name.lower()
+            b_lower = tb.full_name.lower()
+            a_keys = ancestor_keysets.get(a_lower, frozenset())
+            b_keys = ancestor_keysets.get(b_lower, frozenset())
+            has_overlap = bool(a_keys & b_keys) if a_keys and b_keys else False
+
             lin_sim = lineage_similarity(
                 ta.full_name, tb.full_name, upstream_map, downstream_map,
                 transitive_upstream=transitive_upstream,
+                weighted_ancestors=weighted_ancestors,
+                ancestor_keysets=ancestor_keysets,
+                skip_transitive=not has_overlap,
             )
 
         # Use full 4-component weights when lineage applies,
@@ -599,7 +660,15 @@ def detect_duplicates(
                 composite_score=round(composite, 3),
             ))
 
+    # ── Phase 4: Cluster pairs into groups ───────────────────────────
+    if progress_fn:
+        progress_fn(f"Clustering {len(pairs):,} pairs into groups…", 0, 0)
+
     groups = _cluster_pairs(pairs)
+
+    # ── Phase 5: Score gold standard ─────────────────────────────────
+    if progress_fn:
+        progress_fn(f"Scoring {len(groups):,} groups for gold standard…", 0, 0)
 
     table_map = {t.full_name: t for t in tables}
     for group in groups:
@@ -609,18 +678,17 @@ def detect_duplicates(
         if scores:
             group.gold_standard = max(scores, key=scores.get)
 
-    # ── Tag groups for filtering ──────────────────────────────────────────
+    # ── Phase 6: Tag groups for filtering ────────────────────────────
+    if progress_fn:
+        progress_fn(f"Tagging {len(groups):,} groups…", 0, 0)
+
     _apply_tags(groups, table_map, lineage=lineage)
 
     return groups
 
 
 def _derive_group_label(full_names: list[str]) -> str:
-    """Derive a human-readable label from the table names in a duplicate group.
-
-    Tokenises each table name (stripping common prefixes like raw_, dim_, fact_),
-    then picks the tokens that appear across the most tables.
-    """
+    """Derive a human-readable label from the table names in a duplicate group."""
     short_names = [n.split(".")[-1] for n in full_names]
     token_sets = [_tokenize_name(n) for n in short_names]
 
@@ -684,7 +752,6 @@ def _parse_ts(value) -> float:
         return 0.0
     if isinstance(value, (int, float)):
         return float(value)
-    # String timestamps from the SQL Statement API
     from datetime import datetime
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
@@ -698,14 +765,7 @@ def score_gold_standard(
     tables: list[TableInfo],
     lineage: dict | None = None,
 ) -> dict[str, float]:
-    """Score each table in a duplicate group for gold-standard recommendation.
-
-    Scoring factors (higher is better, each out of 10):
-      - Column completeness: more columns → more complete
-      - Freshness: recently updated → more maintained
-      - Consumer count: more downstream consumers → more canonical
-      - Upstream position: sources score higher than derived copies
-    """
+    """Score each table in a duplicate group for gold-standard recommendation."""
     consumer_counts = (lineage or {}).get("consumer_counts", {})
     downstream_map = (lineage or {}).get("downstream_map", {})
 
@@ -714,13 +774,13 @@ def score_gold_standard(
     for t in tables:
         s = 0.0
 
-        # ── Column completeness (0-10) ────────────────────────────────
+        # Column completeness (0-10)
         all_col_counts = [len(tt.columns) for tt in tables]
         max_cols = max(all_col_counts) if all_col_counts else 1
         if max_cols > 0:
             s += (len(t.columns) / max_cols) * 10
 
-        # ── Freshness (0-10) ──────────────────────────────────────────
+        # Freshness (0-10)
         ts = _parse_ts(t.updated_at)
         if ts > 0:
             all_ts = [_parse_ts(tt.updated_at) for tt in tables]
@@ -734,7 +794,7 @@ def score_gold_standard(
                 else:
                     s += 10
 
-        # ── Consumer count (0-10) — lineage-enhanced ──────────────────
+        # Consumer count (0-10)
         if consumer_counts:
             my_consumers = consumer_counts.get(t.full_name.lower(), 0)
             group_consumers = [
@@ -744,13 +804,13 @@ def score_gold_standard(
             if max_consumers > 0:
                 s += (my_consumers / max_consumers) * 10
 
-        # ── Upstream position (0-10) — lineage-enhanced ───────────────
+        # Upstream position (0-10)
         if downstream_map:
             other_names = {tt.full_name.lower() for tt in tables if tt != t}
             my_downstream = downstream_map.get(t.full_name.lower(), set())
             feeds_group_members = my_downstream & other_names
             if feeds_group_members:
-                s += 10  # this table is upstream of others in the group
+                s += 10
 
         scores[t.full_name] = round(s, 1)
 
