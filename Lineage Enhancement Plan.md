@@ -27,7 +27,9 @@ The current `_build_lineage_lookups()` builds **single-hop** upstream/downstream
 
 ---
 
-## Enhancement 1: Deep Common Ancestor Detection
+## Enhancement 1: Deep Common Ancestor Detection ✅
+
+**Status:** Deployed 2026-04-27 | **Test plan:** `TEST_PLAN_ENHANCEMENT_1.md`
 
 **Approach:** Depth-capped BFS on the in-memory upstream graph.
 
@@ -64,11 +66,13 @@ _transitive_upstream: dict[str, dict[str, int]]
   ```
 - Frontend renders these with depth badges, sorted by minimum combined depth (closest common ancestor first)
 
-**Estimated effort:** 1-2 days backend, 0.5 day frontend.
+**Actual parameters (tuned for memory):** `max_depth=3`, `max_ancestors=200` (~75MB)
 
 ---
 
-## Enhancement 2: Lineage-Based Candidate Discovery
+## Enhancement 2: Lineage-Based Candidate Discovery ✅
+
+**Status:** Deployed 2026-04-28 | **Test plan:** `TEST_PLAN_ENHANCEMENT_2.md`
 
 Currently, `_build_candidate_pairs()` only groups tables by name tokens. Tables with different names but the same upstream source are never compared.
 
@@ -82,7 +86,7 @@ Currently, `_build_candidate_pairs()` only groups tables by name tokens. Tables 
 - Only consider ancestors at depth ≤ 3 to avoid pairing every table in the estate through a single hub source
 - Skip ancestors that appear in >100 tables' transitive upstream (they are too generic to be meaningful — e.g. a raw landing table that feeds everything)
 
-**Estimated effort:** 1 day backend.
+**Results:** 49,952 new candidate pairs discovered (3.6x increase over name-only). Generation time: 12.9s.
 
 ---
 
@@ -142,14 +146,14 @@ This gives users immediate context about *why* tables are grouped without needin
 
 ## Implementation Order
 
-| Step | Enhancement | Effort | Dependencies |
-|---|---|---|---|
-| 1 | Deep common ancestor detection (BFS) | 1-2 days | None — pure backend |
-| 2 | Enhanced lineage scoring in detection | 1 day | Step 1 |
-| 3 | Shared ancestors on compare page | 0.5 day | Step 1 |
-| 4 | Lineage-based candidate discovery | 1 day | Step 1 |
-| 5 | Lineage depth in group cards | 1 day | Steps 1-2 |
-| 6 | Lineage graph API endpoint | 2-3 days | Step 1 |
-| 7 | D3-dagre visualisation | 3-4 days | Step 6 |
+| Step | Enhancement | Effort | Dependencies | Status |
+|---|---|---|---|---|
+| 1 | Deep common ancestor detection (BFS) | 1-2 days | None — pure backend | ✅ Deployed |
+| 2 | Enhanced lineage scoring in detection | 1 day | Step 1 | ✅ Deployed (part of E1) |
+| 3 | Shared ancestors on compare page | 0.5 day | Step 1 | ✅ Deployed (part of E1) |
+| 4 | Lineage-based candidate discovery | 1 day | Step 1 | ✅ Deployed |
+| 5 | Lineage depth in group cards | 1 day | Steps 1-2 | Not started |
+| 6 | Lineage graph API endpoint | 2-3 days | Step 1 | Not started |
+| 7 | D3-dagre visualisation | 3-4 days | Step 6 | Not started |
 
-Steps 1-5 deliver analytical value without any new frontend library. Steps 6-7 (the visualisation) are the most effort but also the most impactful for user understanding.
+Steps 1-4 are deployed and delivering analytical value. Steps 5 adds lineage context to group cards. Steps 6-7 (the visualisation) are the most effort but also the most impactful for user understanding.
