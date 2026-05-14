@@ -43,3 +43,12 @@ if os.path.exists(frontend_dir):
     assets_dir = os.path.join(frontend_dir, "assets")
     if os.path.exists(assets_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+
+# SPA catch-all: serve index.html for any path not matched by API routes or
+# static assets, allowing client-side (hash or history) routing to handle it.
+@app.get("/{full_path:path}")
+async def spa_fallback(full_path: str):
+    if os.path.exists(index_html):
+        return FileResponse(index_html)
+    return {"status": "running", "message": "UC Data Quality Explorer API", "docs": "/docs"}
