@@ -168,7 +168,7 @@
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### Sprint 2 — Remaining Low-Effort Frontend Improvements
+# MAGIC ### Sprint 2 — ✅ Completed
 # MAGIC
 # MAGIC These are still pure `app.js` changes, no backend required. Collectively they complete the filtering story started in Sprint 1.
 # MAGIC

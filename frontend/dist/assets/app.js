@@ -24,7 +24,9 @@ let state = {
     minGroupSize: 2,
     crossCatalogOnly: false,
     showDismissed: false,
+    searchQuery: '',
   },
+  sortBy: 'score',
   compactView: false,
   groupsPageSize: 50,
   groupsShown: 50,
@@ -200,6 +202,13 @@ function applyGroupFilters(groups) {
       if (catalogs.size < 2) return false;
     }
 
+    if (state.filters.searchQuery) {
+      const q = state.filters.searchQuery.toLowerCase();
+      const matchesLabel = g.label.toLowerCase().includes(q);
+      const matchesTable = g.tables.some(t => t.toLowerCase().includes(q));
+      if (!matchesLabel && !matchesTable) return false;
+    }
+
     if (state.filters.catalogPrefix) {
       const prefix = state.filters.catalogPrefix.toLowerCase();
       const method = state.filters.catalogPrefixMode === 'all' ? 'every' : 'some';
@@ -214,9 +223,17 @@ function applyGroupFilters(groups) {
   return result;
 }
 
+function sortGroups(groups) {
+  const sorted = [...groups];
+  if (state.sortBy === 'size')     sorted.sort((a, b) => b.tables.length - a.tables.length);
+  if (state.sortBy === 'catalogs') sorted.sort((a, b) => new Set(b.tables.map(t => t.split('.')[0])).size - new Set(a.tables.map(t => t.split('.')[0])).size);
+  if (state.sortBy === 'score')    sorted.sort((a, b) => Math.max(...b.pairs.map(p => p.composite_score)) - Math.max(...a.pairs.map(p => p.composite_score)));
+  return sorted;
+}
+
 function filteredGroupsInfo() {
   const all = state.groups;
-  const filtered = applyGroupFilters(all);
+  const filtered = sortGroups(applyGroupFilters(all));
   const hidden = all.length - filtered.length;
   return { filtered, total: all.length, hidden };
 }
@@ -583,6 +600,40 @@ function renderTableDetail(info) {
   `;
 }
 
+function renderFilterSummary() {
+  const f = state.filters;
+  const defaults = {
+    hideGovernanceViews: true, hidePipelineStages: true, hideSharedSource: false,
+    catalogPrefix: '', minGroupSize: 2, crossCatalogOnly: false,
+    showDismissed: false, searchQuery: '',
+  };
+
+  const chips = [];
+  if (!f.hideGovernanceViews)  chips.push({ label: 'Showing governance views', key: 'hideGovernanceViews', value: true });
+  if (!f.hidePipelineStages)   chips.push({ label: 'Showing pipeline stages',  key: 'hidePipelineStages',  value: true });
+  if (f.hideSharedSource)      chips.push({ label: 'Hiding shared-source',      key: 'hideSharedSource',    value: false });
+  if (f.crossCatalogOnly)      chips.push({ label: 'Cross-catalog only',        key: 'crossCatalogOnly',    value: false });
+  if (f.showDismissed)         chips.push({ label: 'Showing dismissed',         key: 'showDismissed',       value: false });
+  if (f.minGroupSize > 2)      chips.push({ label: `Min size: ${f.minGroupSize}`, key: 'minGroupSize',      value: 2 });
+  if (f.searchQuery)           chips.push({ label: `Search: "${f.searchQuery}"`,  key: 'searchQuery',       value: '' });
+  if (f.catalogPrefix)         chips.push({ label: `Prefix: ${f.catalogPrefix}`,  key: 'catalogPrefix',     value: '' });
+  if (state.sortBy !== 'score') chips.push({ label: `Sort: ${state.sortBy}`, key: '_sortBy', value: 'score' });
+
+  if (!chips.length) return '';
+
+  const chipHtml = chips.map(c => `
+    <span class="tag tag-accent" style="cursor:pointer;font-size:11px" data-filter-key="${c.key}" data-filter-value="${c.value}" title="Click to clear">
+      ${c.label} &times;
+    </span>`).join('');
+
+  return `
+    <div id="filter-summary" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:12px;padding:8px 12px;background:var(--bg-card);border-radius:6px;border:1px solid var(--border)">
+      <span style="font-size:11px;color:var(--text-muted);margin-right:4px">Active filters:</span>
+      ${chipHtml}
+      <button class="btn btn-outline btn-sm" id="clear-filters-btn" style="font-size:11px;padding:2px 8px;margin-left:4px">Clear all</button>
+    </div>`;
+}
+
 // ===== Duplicates =====
 async function renderDuplicates() {
   if (!state.scanned) {
@@ -638,6 +689,17 @@ async function renderDuplicates() {
           <input type="number" id="filter-min-size" min="2" max="20" value="${state.filters.minGroupSize}" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:60px" />
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="text" id="filter-search" value="${state.filters.searchQuery}" placeholder="Search table or group name…" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:220px" />
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Sort by
+          <select id="sort-by" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+            <option value="score"    ${state.sortBy === 'score'    ? 'selected' : ''}>Max similarity</option>
+            <option value="size"     ${state.sortBy === 'size'     ? 'selected' : ''}>Group size</option>
+            <option value="catalogs" ${state.sortBy === 'catalogs' ? 'selected' : ''}>Catalog count</option>
+          </select>
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
           Catalog prefix
           <select id="filter-prefix-mode" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
             <option value="any" ${state.filters.catalogPrefixMode === 'any' ? 'selected' : ''}>Any</option>
@@ -649,6 +711,7 @@ async function renderDuplicates() {
       </div>
       ${hidden ? `<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Showing ${filtered.length} of ${total} groups (${hidden} filtered)</div>` : ''}
     </div>
+    ${renderFilterSummary()}
     <div id="dup-groups">${filtered.length ? (state.compactView ? renderCompactView(filtered) : filtered.slice(0, state.groupsShown).map(g => renderDupGroupCard(g)).join('') + (filtered.length > state.groupsShown ? `<div style="text-align:center;padding:16px"><button class="btn btn-outline" id="show-more-btn">Show more (${state.groupsShown} of ${filtered.length})</button></div>` : '')) : '<div class="empty-state"><h3>No duplicates found</h3><p>Try adjusting the threshold or filters.</p></div>'}</div>
   `;
 
@@ -662,6 +725,8 @@ async function renderDuplicates() {
     state.filters.crossCatalogOnly = $('filter-cross-catalog').checked;
     state.filters.showDismissed = $('filter-show-dismissed').checked;
     state.filters.minGroupSize = parseInt($('filter-min-size').value) || 2;
+    state.filters.searchQuery = $('filter-search').value.trim();
+    state.sortBy = $('sort-by').value;
     state.groupsShown = state.groupsPageSize;  // reset pagination on filter change
     renderDuplicates();
   }
@@ -673,10 +738,49 @@ async function renderDuplicates() {
   $('filter-cross-catalog').onchange = onFilterChange;
   $('filter-show-dismissed').onchange = onFilterChange;
 
+  // Filter summary chip clicks and clear-all
+  document.getElementById('filter-summary')?.addEventListener('click', e => {
+    const chip = e.target.closest('[data-filter-key]');
+    if (chip) {
+      const key = chip.dataset.filterKey;
+      const val = chip.dataset.filterValue;
+      if (key === '_sortBy') { state.sortBy = val; }
+      else {
+        const parsed = val === 'true' ? true : val === 'false' ? false : (isNaN(val) ? val : Number(val));
+        state.filters[key] = parsed;
+      }
+      state.groupsShown = state.groupsPageSize;
+      renderDuplicates();
+    }
+  });
+
+  const clearBtn = $('clear-filters-btn');
+  if (clearBtn) clearBtn.onclick = () => {
+    state.filters.hideGovernanceViews = true;
+    state.filters.hidePipelineStages  = true;
+    state.filters.hideSharedSource    = false;
+    state.filters.catalogPrefix       = '';
+    state.filters.minGroupSize        = 2;
+    state.filters.crossCatalogOnly    = false;
+    state.filters.showDismissed       = false;
+    state.filters.searchQuery         = '';
+    state.sortBy = 'score';
+    state.groupsShown = state.groupsPageSize;
+    renderDuplicates();
+  };
+
   $('compact-toggle').onclick = () => {
     state.compactView = !state.compactView;
     renderDuplicates();
   };
+
+  let _searchTimer = null;
+  $('filter-search').oninput = () => {
+    clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(onFilterChange, 400);
+  };
+
+  $('sort-by').onchange = onFilterChange;
 
   let _minSizeTimer = null;
   $('filter-min-size').oninput = () => {
