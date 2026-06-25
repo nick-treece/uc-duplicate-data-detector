@@ -142,7 +142,7 @@
 
 # DBTITLE 1,Section 6: Quick Wins — This Sprint
 # MAGIC %md
-# MAGIC ## 6. Quick Wins — Recommended for This Sprint
+# MAGIC ## 6. Quick Wins — ✅ Completed
 # MAGIC
 # MAGIC The five changes below are all frontend-only, achievable in a single session, and would collectively transform the navigability of the Duplicates page for a large estate.
 # MAGIC
@@ -155,3 +155,68 @@
 # MAGIC - **Minimum group size filter** — Add a small numeric input (`min=2`, `default=2`) to the existing filter bar. In `applyGroupFilters`, add: `if (state.filters.minGroupSize > 2 && g.tables.length < state.filters.minGroupSize) return false`. Setting this to 3 immediately removes all pairs, which tend to dominate the list and are the lowest-confidence results.
 # MAGIC
 # MAGIC - **Cross-catalog only toggle** — Add a checkbox to the filter bar. In `applyGroupFilters`, add: `if (state.filters.crossCatalogOnly && new Set(g.tables.map(t => t.split('.')[0])).size < 2) return false`. Cross-catalog groups are almost always the most architecturally significant and deserve their own fast path to the top of the list.
+
+# COMMAND ----------
+
+# DBTITLE 1,Section 7: Next Recommended Steps
+# MAGIC %md
+# MAGIC ## 7. Next Recommended Steps
+# MAGIC
+# MAGIC The five quick wins from Section 6 are now shipped. The Duplicates page is meaningfully more navigable: groups are collapsible, dismissible, filterable by size and catalog boundary, and can be scanned in a compact table view.
+# MAGIC
+# MAGIC The remaining work falls into three natural sprints based on effort and dependency.
+# MAGIC
+# MAGIC ---
+# MAGIC
+# MAGIC ### Sprint 2 — Remaining Low-Effort Frontend Improvements
+# MAGIC
+# MAGIC These are still pure `app.js` changes, no backend required. Collectively they complete the filtering story started in Sprint 1.
+# MAGIC
+# MAGIC | # | Enhancement | Implementation note |
+# MAGIC |---|---|---|
+# MAGIC | 6 | **Free-text search** | Add a debounced text input to the filter bar. Match against `g.label` and `g.tables.some(t => t.includes(query))`. Reuse the existing 400ms debounce pattern from the catalog prefix input. |
+# MAGIC | 7 | **Sort controls** | Add a `<select>` (options: max score, group size, catalog count, recency) after `applyGroupFilters`. Apply a sort step before `slice(0, groupsShown)`. Store selection in `state.sortBy`. |
+# MAGIC | 8 | **Active filter summary bar** | Render a row of dismissible chips above `#dup-groups` for every non-default filter value in `state.filters`. Each chip resets that individual filter and calls `renderDuplicates()`. Include a “Clear all” button that resets the entire `state.filters` object to defaults. |
+# MAGIC
+# MAGIC **Suggested order:** Sort controls first (highest impact, simplest), then free-text search, then the filter summary bar.
+# MAGIC
+# MAGIC ---
+# MAGIC
+# MAGIC ### Sprint 3 — Medium-Effort Filtering and Display
+# MAGIC
+# MAGIC These require either additional data on the group object, a backend change, or a more involved frontend component.
+# MAGIC
+# MAGIC | # | Enhancement | Dependency | Implementation note |
+# MAGIC |---|---|---|---|
+# MAGIC | 9 | **Similarity score range** | None | Dual-handle range slider (min/max) in the filter bar. Filter on `Math.max(...g.pairs.map(p => p.composite_score))`. Consider a lightweight CSS-only dual range or a small vanilla JS implementation — no library needed at this scale. |
+# MAGIC | 10 | **Schema prefix filter** | None | Mirror the catalog prefix control but match `t.split('.')[1]` (the schema segment). Can share the same Any/All mode toggle. |
+# MAGIC | 11 | **Table type filter** | Group object needs `table_types` field | Add `table_types: list[str]` to the serialised group dict in `duplicates.py` (derived from `TableInfo.table_type`). Frontend: a multi-select toggle for TABLE / VIEW / EXTERNAL. |
+# MAGIC | 12 | **Owner filter** | Group object needs `owners` field | Add `owners: list[str]` to the group dict. Frontend: a dropdown populated dynamically from the distinct owners across all groups in `state.groups`. |
+# MAGIC | 13 | **Lineage depth badge on group cards** | Enhancement 4 in Lineage Plan (not yet started) | Surface the deepest common ancestor and hop count on cards tagged `pipeline_stage` or `shared_source`. Requires `shared_ancestors` data to be included in the cached group dict — currently only returned by the compare endpoint on demand. |
+# MAGIC
+# MAGIC ---
+# MAGIC
+# MAGIC ### Sprint 4 — High-Impact Detection and Visualisation
+# MAGIC
+# MAGIC These address the root problem (too many groups) rather than making the existing list easier to navigate. Higher effort but highest long-term impact.
+# MAGIC
+# MAGIC | # | Enhancement | Effort | Why now |
+# MAGIC |---|---|---|---|
+# MAGIC | 14 | **“Dead duplicate” detection** | Medium | Add a `has_dead_duplicate` flag to each group during scoring in `duplicates.py`. A dead duplicate is a non-gold table with zero entries in `_consumer_counts`. Surface a “Safe to deprecate?” badge on the card and add a filter toggle. Actionable immediately: these are the groups where cleanup carries zero risk. |
+# MAGIC | 15 | **Duplication heatmap** | Medium | A catalog × catalog matrix aggregated from `state.groups` — no new API needed. Add as a new “Heatmap” tab on the Duplicates page. Renders the full cross-catalog duplication picture in a single glance. |
+# MAGIC | 16 | **Owner × catalog summary table** | Medium | A pivot of `state.groups` × `state.tables` ownership data. Surfaces which owners have the most cross-catalog duplication. Useful for generating team-level remediation tasks. |
+# MAGIC | 17 | **Schema fingerprinting + schema duplicate groups** | High | New pass in `scanner.py` computing per-schema column fingerprints. New `/api/duplicates/schema-groups` endpoint. New sub-view on the Duplicates page. Result set is orders of magnitude smaller than table-level groups, making it the best long-term entry point for architectural review. |
+# MAGIC
+# MAGIC ---
+# MAGIC
+# MAGIC ### Dependency summary
+# MAGIC
+# MAGIC ```
+# MAGIC Sprint 1 (done) ─┬─ Sprint 2 (low effort, no deps)
+# MAGIC                  └─ Sprint 3 (medium, some backend deps)
+# MAGIC                       └─ Sprint 4 ─┬─ Dead duplicate detection (standalone)
+# MAGIC                                    ├─ Heatmap (needs groups in state — already available)
+# MAGIC                                    └─ Schema fingerprinting (independent, highest effort)
+# MAGIC ```
+# MAGIC
+# MAGIC Sprints 2 and 3 can be worked in parallel on separate branches. Sprint 4 items are independent of each other and can be prioritised individually.

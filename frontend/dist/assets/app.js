@@ -21,7 +21,11 @@ let state = {
     hideSharedSource: false,
     catalogPrefix: '',
     catalogPrefixMode: 'any',
+    minGroupSize: 2,
+    crossCatalogOnly: false,
+    showDismissed: false,
   },
+  compactView: false,
   groupsPageSize: 50,
   groupsShown: 50,
   cacheLoading: true,   // true during initial cache check on startup
@@ -132,6 +136,32 @@ function loading(msg = 'Loading...') {
   return `<div class="loading"><div class="spinner"></div>${msg}</div>`;
 }
 
+// ===== Dismissed Groups (localStorage) =====
+function groupKey(g) {
+  return g.tables.slice().sort().join(',');
+}
+
+function getDismissedKeys() {
+  try { return new Set(JSON.parse(localStorage.getItem('uc-dismissed-groups') || '[]')); }
+  catch { return new Set(); }
+}
+
+function saveDismissedKeys(keys) {
+  localStorage.setItem('uc-dismissed-groups', JSON.stringify([...keys]));
+}
+
+function dismissGroup(g) {
+  const keys = getDismissedKeys();
+  keys.add(groupKey(g));
+  saveDismissedKeys(keys);
+}
+
+function undismissGroup(g) {
+  const keys = getDismissedKeys();
+  keys.delete(groupKey(g));
+  saveDismissedKeys(keys);
+}
+
 // ===== Group Filtering =====
 function applyGroupFilters(groups) {
   console.log('[FILTER] input groups:', groups.length,
@@ -157,6 +187,18 @@ function applyGroupFilters(groups) {
 
     if (state.filters.hideSharedSource && tags.includes('shared_source'))
       return false;
+
+    const dismissed = getDismissedKeys();
+    if (!state.filters.showDismissed && dismissed.has(groupKey(g)))
+      return false;
+
+    if (state.filters.minGroupSize > 2 && g.tables.length < state.filters.minGroupSize)
+      return false;
+
+    if (state.filters.crossCatalogOnly) {
+      const catalogs = new Set(g.tables.map(t => t.split('.')[0]));
+      if (catalogs.size < 2) return false;
+    }
 
     if (state.filters.catalogPrefix) {
       const prefix = state.filters.catalogPrefix.toLowerCase();
@@ -564,7 +606,12 @@ async function renderDuplicates() {
       <button class="btn btn-outline btn-sm" id="redetect-btn">Re-detect</button>
     </div>
     <div class="card" style="margin-bottom:16px;padding:14px">
-      <div style="font-weight:600;font-size:13px;margin-bottom:10px">Filters</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <span style="font-weight:600;font-size:13px">Filters</span>
+        <button class="btn btn-outline btn-sm" id="compact-toggle" title="${state.compactView ? 'Switch to card view' : 'Switch to compact view'}">
+          ${state.compactView ? '&#9646;&#9646; Card view' : '&#8803; Compact view'}
+        </button>
+      </div>
       <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center">
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
           <input type="checkbox" id="filter-gov" ${state.filters.hideGovernanceViews ? 'checked' : ''} />
@@ -576,7 +623,19 @@ async function renderDuplicates() {
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
           <input type="checkbox" id="filter-pipeline" ${state.filters.hidePipelineStages ? 'checked' : ''} />
-          Hide medallion pipeline stages
+          Hide pipeline stages
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="filter-cross-catalog" ${state.filters.crossCatalogOnly ? 'checked' : ''} />
+          Cross-catalog only
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="filter-show-dismissed" ${state.filters.showDismissed ? 'checked' : ''} />
+          Show dismissed
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Min group size
+          <input type="number" id="filter-min-size" min="2" max="20" value="${state.filters.minGroupSize}" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:60px" />
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px">
           Catalog prefix
@@ -590,7 +649,7 @@ async function renderDuplicates() {
       </div>
       ${hidden ? `<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Showing ${filtered.length} of ${total} groups (${hidden} filtered)</div>` : ''}
     </div>
-    <div id="dup-groups">${filtered.length ? filtered.slice(0, state.groupsShown).map(g => renderDupGroupCard(g)).join('') + (filtered.length > state.groupsShown ? `<div style="text-align:center;padding:16px"><button class="btn btn-outline" id="show-more-btn">Show more (${state.groupsShown} of ${filtered.length})</button></div>` : '') : '<div class="empty-state"><h3>No duplicates found</h3><p>Try adjusting the threshold or filters.</p></div>'}</div>
+    <div id="dup-groups">${filtered.length ? (state.compactView ? renderCompactView(filtered) : filtered.slice(0, state.groupsShown).map(g => renderDupGroupCard(g)).join('') + (filtered.length > state.groupsShown ? `<div style="text-align:center;padding:16px"><button class="btn btn-outline" id="show-more-btn">Show more (${state.groupsShown} of ${filtered.length})</button></div>` : '')) : '<div class="empty-state"><h3>No duplicates found</h3><p>Try adjusting the threshold or filters.</p></div>'}</div>
   `;
 
   // ── Filter event handlers ──
@@ -600,6 +659,9 @@ async function renderDuplicates() {
     state.filters.hideSharedSource = $('filter-shared-source').checked;
     state.filters.catalogPrefix = $('filter-prefix').value.trim();
     state.filters.catalogPrefixMode = $('filter-prefix-mode').value;
+    state.filters.crossCatalogOnly = $('filter-cross-catalog').checked;
+    state.filters.showDismissed = $('filter-show-dismissed').checked;
+    state.filters.minGroupSize = parseInt($('filter-min-size').value) || 2;
     state.groupsShown = state.groupsPageSize;  // reset pagination on filter change
     renderDuplicates();
   }
@@ -608,6 +670,19 @@ async function renderDuplicates() {
   $('filter-pipeline').onchange = onFilterChange;
   $('filter-shared-source').onchange = onFilterChange;
   $('filter-prefix-mode').onchange = onFilterChange;
+  $('filter-cross-catalog').onchange = onFilterChange;
+  $('filter-show-dismissed').onchange = onFilterChange;
+
+  $('compact-toggle').onclick = () => {
+    state.compactView = !state.compactView;
+    renderDuplicates();
+  };
+
+  let _minSizeTimer = null;
+  $('filter-min-size').oninput = () => {
+    clearTimeout(_minSizeTimer);
+    _minSizeTimer = setTimeout(onFilterChange, 400);
+  };
 
   // "Show more" button — appends next page without full re-render
   const showMoreBtn = $('show-more-btn');
@@ -664,6 +739,45 @@ async function renderDuplicates() {
   };
 }
 
+function renderCompactView(groups) {
+  const rows = groups.map(g => {
+    const maxScore = g.pairs.length ? Math.max(...g.pairs.map(p => p.composite_score)) : 0;
+    const catalogs = [...new Set(g.tables.map(t => t.split('.')[0]))];
+    const tags = (g.tags || []).map(t => `<span class="tag tag-accent" style="font-size:10px">${t}</span>`).join(' ');
+    const goldShort = g.gold_standard ? g.gold_standard.split('.').pop() : '\u2014';
+    const firstPair = g.pairs[0];
+    const compareBtn = firstPair
+      ? `<button class="btn btn-outline btn-sm compare-btn" data-a="${firstPair.table_a}" data-b="${firstPair.table_b}">Compare</button>`
+      : '';
+    return `<tr>
+      <td style="font-weight:600;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${g.label}">${g.label}</td>
+      <td style="text-align:center">${g.tables.length}</td>
+      <td><span class="similarity-score" style="color:${similarityColor(maxScore)}">${(maxScore * 100).toFixed(0)}%</span></td>
+      <td style="text-align:center">${catalogs.length}</td>
+      <td style="font-size:11px;color:var(--text-muted);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${g.gold_standard || ''}">${goldShort}</td>
+      <td>${tags}</td>
+      <td style="white-space:nowrap">${compareBtn}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Group</th>
+          <th>Tables</th>
+          <th>Score</th>
+          <th>Catalogs</th>
+          <th>Gold standard</th>
+          <th>Tags</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
 function renderDupGroupCard(g) {
   const maxScore = g.pairs.length ? Math.max(...g.pairs.map(p => p.composite_score)) : 0;
   const catalogSet = new Set(g.tables.map(t => t.split('.')[0]));
@@ -673,7 +787,10 @@ function renderDupGroupCard(g) {
     <div class="dup-group">
       <div class="dup-group-header">
         <span class="dup-group-title">${g.label} \u2014 ${g.tables.length} tables${crossCatalog ? ` across ${catalogSet.size} catalogs` : ''}</span>
-        <span class="similarity-score" style="color:${similarityColor(maxScore)}">${(maxScore * 100).toFixed(0)}% max similarity</span>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="similarity-score" style="color:${similarityColor(maxScore)}">${(maxScore * 100).toFixed(0)}% max similarity</span>
+          <button class="btn btn-outline btn-sm dismiss-btn" data-key="${groupKey(g)}" style="font-size:11px;padding:2px 8px;opacity:0.6" title="Dismiss this group">Dismiss</button>
+        </div>
       </div>
       <div class="similarity-bar"><div class="similarity-bar-fill" style="width:${maxScore * 100}%;background:${similarityColor(maxScore)}"></div></div>
       <div class="dup-tables-list" style="margin-top:10px">
@@ -684,8 +801,11 @@ function renderDupGroupCard(g) {
         }).join('')}
       </div>
       ${g.gold_standard ? `<div style="margin-top:8px"><span class="gold-badge">\u2605 Gold Standard: ${g.gold_standard}</span></div>` : ''}
-      <div style="margin-top:12px">
-        <table class="data-table">
+      <details style="margin-top:12px">
+        <summary style="cursor:pointer;font-size:12px;color:var(--text-muted);user-select:none;padding:4px 0">
+          Show ${g.pairs.length} pair${g.pairs.length !== 1 ? 's' : ''}
+        </summary>
+        <table class="data-table" style="margin-top:8px">
           <thead><tr><th>Table A</th><th>Table B</th><th>Columns</th><th>Types</th><th>Name</th><th>Lineage</th><th>Score</th><th></th></tr></thead>
           <tbody>
             ${g.pairs.slice(0, 6).map(p => {
@@ -702,12 +822,22 @@ function renderDupGroupCard(g) {
             }).join('')}
           </tbody>
         </table>
-      </div>
+      </details>
     </div>
   `;
 }
 
 document.addEventListener('click', (e) => {
+  const dismissBtn = e.target.closest('.dismiss-btn');
+  if (dismissBtn) {
+    const key = dismissBtn.dataset.key;
+    const keys = getDismissedKeys();
+    keys.add(key);
+    saveDismissedKeys(keys);
+    renderDuplicates();
+    return;
+  }
+
   const btn = e.target.closest('.compare-btn');
   if (btn) {
     const [c1, s1, t1] = btn.dataset.a.split('.');
