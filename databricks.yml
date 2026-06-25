@@ -25,6 +25,8 @@ resources:
         Refreshes metadata schema snapshot tables (CTAS) from
         system.information_schema. Re-creates all tables with current
         metadata visible to the job owner.
+      run_as:
+        service_principal_name: 369aa358-8799-4311-a5a3-c3b20e5fdab5
       schedule:
         quartz_cron_expression: "0 0 0 ? * SAT"
         timezone_id: Europe/London
@@ -35,6 +37,9 @@ resources:
               path: ./scripts/create_governance_tables.sql
               source: WORKSPACE
             warehouse_id: ${var.warehouse_id}
+        - task_key: ingest_group_membership
+          notebook_task:
+            notebook_path: ./scripts/ingest_group_membership.ipynb
 
 targets:
   dev:

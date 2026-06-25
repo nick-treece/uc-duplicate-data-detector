@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 
 from server.scanner import scanner, TableInfo
-from server.comparator import compare_tables, fetch_sample_data, build_lineage_context, build_access_tree, compute_shared_access
+from server.comparator import compare_tables, fetch_sample_data, build_lineage_context, build_access_tree, compute_shared_access, compute_lineage_graph
 
 logger = logging.getLogger(__name__)
 
@@ -39,26 +39,35 @@ def sample(catalog: str, schema: str, table: str):
         result = fetch_sample_data(t.full_name)
         if result is None:
             raise HTTPException(status_code=500, detail="Could not fetch sample data")
-        # Build access trees with group membership
-        try:
-            all_principals = set()
-            for t in [ta, tb]:
-                if hasattr(t, "permissions") and t.permissions:
-                    for p in t.permissions:
-                        principal = p.principal if hasattr(p, "principal") else p.get("principal", "")
-                        all_principals.add(principal)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "traceback": traceback.format_exc()},
+        )
 
-            group_members = scanner.query_group_members(list(all_principals))
-            result["access_tree_a"] = build_access_tree(ta, group_members)
-            result["access_tree_b"] = build_access_tree(tb, group_members)
-            result["shared_access"] = compute_shared_access(
-                result["access_tree_a"], result["access_tree_b"],
-            )
-        except Exception as access_err:
-            logger.error(f"Access tree failed: {access_err}")
-            result["access_tree_a"] = []
-            result["access_tree_b"] = []
 
+
+@router.get("/lineage-graph/{cat1}/{s1}/{t1}/{cat2}/{s2}/{t2}")
+def lineage_graph(cat1: str, s1: str, t1: str, cat2: str, s2: str, t2: str):
+    """Return the connecting lineage subgraph between two tables as a DAG."""
+    try:
+        if not scanner.is_scanned:
+            raise HTTPException(status_code=400, detail="No scan has been run yet")
+
+        full_a = f"{cat1}.{s1}.{t1}"
+        full_b = f"{cat2}.{s2}.{t2}"
+
+        result = compute_lineage_graph(
+            table_a_name=full_a,
+            table_b_name=full_b,
+            upstream_map=scanner._upstream_map,
+            downstream_map=scanner._downstream_map,
+            consumer_counts=scanner._consumer_counts,
+            lineage_edges=scanner._lineage_edges,
+        )
         return result
     except HTTPException:
         raise
@@ -87,6 +96,7 @@ def compare(cat1: str, schema1: str, table1: str, cat2: str, schema2: str, table
                 consumer_counts=scanner._consumer_counts,
                 column_mappings=col_mappings,
                 lineage_edges=scanner._lineage_edges,
+                transitive_upstream=scanner._transitive_upstream,
             )
             result["lineage"] = lineage_ctx
         except Exception as lineage_err:
@@ -139,12 +149,17 @@ def lineage_status():
         for k, v in list(scanner._upstream_map.items())[:5]:
             sample_upstream[k] = sorted(v)[:3]
 
+    transitive_size = len(scanner._transitive_upstream) if hasattr(scanner, '_transitive_upstream') else -1
+    transitive_entries = sum(len(v) for v in scanner._transitive_upstream.values()) if hasattr(scanner, '_transitive_upstream') and scanner._transitive_upstream else 0
+
     return {
         "is_scanned": scanner.is_scanned,
         "upstream_map_size": upstream_size,
         "downstream_map_size": downstream_size,
         "lineage_edges_size": edges_size,
         "consumer_counts_size": consumers_size,
+        "transitive_upstream_tables": transitive_size,
+        "transitive_upstream_entries": transitive_entries,
         "upstream_map_type": type(scanner._upstream_map).__name__ if hasattr(scanner, '_upstream_map') else "missing",
         "sample_upstream": sample_upstream,
     }

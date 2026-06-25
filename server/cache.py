@@ -252,38 +252,58 @@ class CacheManager:
             f"{len(groups)} duplicate group(s)"
         )
 
-    def _write_groups_batched(
-        self, scan_id: int, groups: list[dict], batch_size: int = 50
-    ):
-        """INSERT groups in batches to stay within SQL size limits."""
-        for i in range(0, len(groups), batch_size):
-            batch = groups[i : i + batch_size]
-            value_rows: list[str] = []
+    # SQL Statement API has a ~1MB payload limit; stay well under it.
+    _MAX_SQL_BYTES = 800_000
 
-            for g in batch:
-                gid = int(g["group_id"])
-                label = self._esc(g.get("label", ""))
-                tables = self._esc(json.dumps(g.get("tables", [])))
-                pairs = self._esc(
-                    json.dumps(g.get("pairs", []), default=str)
-                )
-                gold = self._esc(g.get("gold_standard") or "")
-                scores = self._esc(
-                    json.dumps(g.get("gold_scores", {}), default=str)
-                )
-                tags = self._esc(
-                    json.dumps(g.get("tags", []))
-                )
-                value_rows.append(
-                    f"({scan_id}, {gid}, '{label}', '{tables}', "
-                    f"'{pairs}', '{gold}', '{scores}', '{tags}')"
-                )
+    def _write_groups_batched(self, scan_id: int, groups: list[dict]):
+        """INSERT groups with adaptive batching based on SQL payload size.
 
-            sql = (
-                f"INSERT INTO {CACHE_SCHEMA}.duplicate_groups VALUES "
-                + ", ".join(value_rows)
-            )
-            self._run_sql(sql)
+        Instead of a fixed batch_size (which fails when individual groups
+        contain large pairs_json), this accumulates rows until the SQL
+        statement approaches the API payload limit, then flushes.
+        """
+        insert_prefix = f"INSERT INTO {CACHE_SCHEMA}.duplicate_groups VALUES "
+        prefix_len = len(insert_prefix)
+
+        value_rows: list[str] = []
+        current_len = prefix_len
+
+        for g in groups:
+            row = self._serialise_group_row(scan_id, g)
+            row_len = len(row) + 2  # account for ", " separator
+
+            # Flush if adding this row would exceed the limit
+            if value_rows and (current_len + row_len) > self._MAX_SQL_BYTES:
+                self._flush_group_rows(insert_prefix, value_rows)
+                value_rows = []
+                current_len = prefix_len
+
+            value_rows.append(row)
+            current_len += row_len
+
+        # Flush remaining
+        if value_rows:
+            self._flush_group_rows(insert_prefix, value_rows)
+
+    def _serialise_group_row(self, scan_id: int, g: dict) -> str:
+        """Serialise a single group dict into a SQL VALUES tuple string."""
+        gid = int(g["group_id"])
+        label = self._esc(g.get("label", ""))
+        tables = self._esc(json.dumps(g.get("tables", [])))
+        pairs = self._esc(json.dumps(g.get("pairs", []), default=str))
+        gold = self._esc(g.get("gold_standard") or "")
+        scores = self._esc(json.dumps(g.get("gold_scores", {}), default=str))
+        tags = self._esc(json.dumps(g.get("tags", [])))
+        return (
+            f"({scan_id}, {gid}, '{label}', '{tables}', "
+            f"'{pairs}', '{gold}', '{scores}', '{tags}')"
+        )
+
+    def _flush_group_rows(self, prefix: str, rows: list[str]):
+        """Execute one INSERT statement with the accumulated rows."""
+        sql = prefix + ", ".join(rows)
+        logger.debug(f"Cache INSERT: {len(rows)} rows, {len(sql):,} bytes")
+        self._run_sql(sql)
 
     # ── Read cache ────────────────────────────────────────────────────────
 

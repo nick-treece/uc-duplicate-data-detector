@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 import urllib.request
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -123,6 +123,8 @@ class CatalogScanner:
         self._downstream_map: dict[str, set[str]] = {}
         self._consumer_counts: dict[str, int] = {}
         self._column_lineage_map: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        self._transitive_upstream: dict[str, dict[str, int]] = {}  # table → {ancestor: min_depth}
+        self._transitive_upstream: dict[str, dict[str, int]] = {}
 
         # Background scan state
         self._scan_lock = threading.Lock()
@@ -176,6 +178,7 @@ class CatalogScanner:
                 "errors": [],
                 "error": None,
                 "result": None,
+                "_start_time": time.time(),
             }
         thread = threading.Thread(target=self._run_scan_background, daemon=True)
         thread.start()
@@ -186,6 +189,13 @@ class CatalogScanner:
             status = dict(self._scan_status)
             status["errors"] = list(self._scan_status.get("errors", []))
             status["catalogs_scanned"] = list(self._scan_status.get("catalogs_scanned", []))
+            # Dynamically append elapsed time when running
+            start_time = self._scan_status.get("_start_time")
+            if status.get("state") == "running" and start_time:
+                elapsed = int(time.time() - start_time)
+                status["message"] = f"{status['message']} ({elapsed}s)"
+            # Don't expose internal field to frontend
+            status.pop("_start_time", None)
             return status
 
     def _run_scan_background(self):
@@ -193,7 +203,7 @@ class CatalogScanner:
         try:
             result = self.scan_all()
 
-            # ── Load lineage data ─────────────────────────────────────
+            # \u2500\u2500 Load lineage data \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             try:
                 self.bulk_load_table_lineage()
                 self.bulk_load_column_lineage()
@@ -201,7 +211,7 @@ class CatalogScanner:
                 logger.warning(f"Lineage loading failed (non-fatal): {e}")
                 self._add_error(f"Lineage: {e}")
 
-            # ── Detect duplicates ─────────────────────────────────────
+            # \u2500\u2500 Detect duplicates \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             self._update_status(message="Detecting duplicates\u2026")
             try:
                 from server.duplicates import detect_duplicates
@@ -210,8 +220,15 @@ class CatalogScanner:
                     "downstream_map": self._downstream_map,
                     "consumer_counts": self._consumer_counts,
                     "column_lineage_map": self._column_lineage_map,
+                    "transitive_upstream": self._transitive_upstream,
                 }
-                groups = detect_duplicates(self._tables, lineage=lineage_ctx)
+                def _detection_progress(msg, done, total):
+                    if total > 0:
+                        self._update_status(message=f"{msg} ({done:,}/{total:,})")
+                    else:
+                        self._update_status(message=msg)
+
+                groups = detect_duplicates(self._tables, lineage=lineage_ctx, progress_fn=_detection_progress)
                 self._duplicate_groups = [g.to_dict() for g in groups]
                 result["groups_count"] = len(self._duplicate_groups)
                 logger.info(f"Detected {len(self._duplicate_groups)} duplicate groups")
@@ -221,7 +238,7 @@ class CatalogScanner:
                 result["groups_count"] = 0
                 self._add_error(f"Duplicate detection: {e}")
 
-            # ── Write to UC cache ─────────────────────────────────────
+            # \u2500\u2500 Write to UC cache \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             self._update_status(message="Writing to cache\u2026")
             try:
                 from server.cache import CacheManager
@@ -243,7 +260,7 @@ class CatalogScanner:
                 self._scan_status["message"] = f"Scan failed: {e}"
                 self._scan_status["error"] = str(e)
 
-    # ── SQL execution ─────────────────────────────────────────────────────
+    # \u2500\u2500 SQL execution \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def _run_sql(self, sql: str, quiet: bool = False) -> list[list] | None:
         sql_preview = sql[:120].replace("\n", " ")
@@ -273,13 +290,13 @@ class CatalogScanner:
                 return self._poll_statement(statement_id, sql_preview)
 
             error_msg = status.get("error", {}).get("message", "no error details")
-            msg = f"SQL state \'{state}\': {error_msg}"
+            msg = f"SQL state '{state}': {error_msg}"
             logger.warning(f"{msg} [query: {sql_preview}...]")
             if not quiet:
                 self._add_error(msg)
         except Exception as e:
-            msg = f"SQL exception: {e}"
-            logger.warning(f"{msg} [query: {sql_preview}...]")
+            msg = f"SQL exception ({type(e).__name__}): {e} [query: {sql_preview[:80]}]"
+            logger.warning(msg)
             if not quiet:
                 self._add_error(msg)
         return None
@@ -299,7 +316,7 @@ class CatalogScanner:
                 if state in ("PENDING", "RUNNING"):
                     continue
                 error_msg = data.get("status", {}).get("error", {}).get("message", "no details")
-                msg = f"SQL poll state \'{state}\': {error_msg}"
+                msg = f"SQL poll state '{state}': {error_msg}"
                 logger.warning(f"{msg} [query: {sql_preview}...]")
                 self._add_error(msg)
                 return None
@@ -333,7 +350,7 @@ class CatalogScanner:
             result = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
         return all_rows
 
-    # ── Catalog listing ───────────────────────────────────────────────────
+    # \u2500\u2500 Catalog listing \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def list_catalogs(self) -> list[dict]:
         rows = self._run_sql(
@@ -350,7 +367,7 @@ class CatalogScanner:
             result.append({"name": name, "owner": row[1], "comment": row[2]})
         return result
 
-    # ── Full scan ─────────────────────────────────────────────────────────
+    # \u2500\u2500 Full scan \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def scan_all(self) -> dict:
         self.reset_client()
@@ -369,7 +386,7 @@ class CatalogScanner:
                     f"Catalog listing failed with {len(sql_errors)} SQL error(s): "
                     + "; ".join(sql_errors)
                 )
-            self._add_error("No catalogs returned — the snapshot tables may be empty.")
+            self._add_error("No catalogs returned \u2014 the snapshot tables may be empty.")
 
         self._update_status(
             catalogs_total=len(catalogs),
@@ -416,8 +433,8 @@ class CatalogScanner:
         schema_rows = self._run_sql(
             f"SELECT schema_name, schema_owner, comment "
             f"FROM {src}.schemata "
-            f"WHERE catalog_name = \'{catalog}\' "
-            f"  AND schema_name != \'information_schema\'"
+            f"WHERE catalog_name = '{catalog}' "
+            f"  AND schema_name != 'information_schema'"
         )
         local_schemas: list[SchemaInfo] = []
         if schema_rows:
@@ -432,8 +449,8 @@ class CatalogScanner:
             f"SELECT table_name, table_schema, table_type, "
             f"       table_owner, comment, created, last_altered "
             f"FROM {src}.tables "
-            f"WHERE table_catalog = \'{catalog}\' "
-            f"  AND table_schema != \'information_schema\'"
+            f"WHERE table_catalog = '{catalog}' "
+            f"  AND table_schema != 'information_schema'"
         )
         local_tables: list[TableInfo] = []
         if table_rows:
@@ -450,8 +467,8 @@ class CatalogScanner:
             f"SELECT table_schema, table_name, column_name, "
             f"       full_data_type, ordinal_position, is_nullable, comment "
             f"FROM {src}.columns "
-            f"WHERE table_catalog = \'{catalog}\' "
-            f"  AND table_schema != \'information_schema\' "
+            f"WHERE table_catalog = '{catalog}' "
+            f"  AND table_schema != 'information_schema' "
             f"ORDER BY table_schema, table_name, ordinal_position"
         )
         if col_rows:
@@ -482,7 +499,7 @@ class CatalogScanner:
             "column_count": sum(len(t.columns) for t in local_tables),
         }
 
-    # ── Permissions fetching ──────────────────────────────────────────────
+    # \u2500\u2500 Permissions fetching \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def _fetch_permissions(self, catalog: str, tables: list[TableInfo]):
         source = self._METADATA_SOURCE
@@ -494,7 +511,7 @@ class CatalogScanner:
         rows = self._run_sql(
             f"SELECT grantor, grantee, privilege_type "
             f"FROM {source}.catalog_privileges "
-            f"WHERE catalog_name = \'{catalog}\'"
+            f"WHERE catalog_name = '{catalog}'"
         )
         if rows:
             grouped: dict[str, list[str]] = defaultdict(list)
@@ -510,7 +527,7 @@ class CatalogScanner:
         rows = self._run_sql(
             f"SELECT grantor, grantee, privilege_type, schema_name "
             f"FROM {source}.schema_privileges "
-            f"WHERE catalog_name = \'{catalog}\'"
+            f"WHERE catalog_name = '{catalog}'"
         )
         if rows:
             grouped_s: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -526,7 +543,7 @@ class CatalogScanner:
         rows = self._run_sql(
             f"SELECT grantor, grantee, privilege_type, table_schema, table_name "
             f"FROM {source}.table_privileges "
-            f"WHERE table_catalog = \'{catalog}\'"
+            f"WHERE table_catalog = '{catalog}'"
         )
         if rows:
             grouped_t: dict[tuple[str, str, str], list[str]] = defaultdict(list)
@@ -613,13 +630,13 @@ class CatalogScanner:
     def get_all_tables_raw(self) -> list[TableInfo]:
         return self._tables
 
-    # ── Background re-detection ───────────────────────────────────────────
+    # \u2500\u2500 Background re-detection \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def start_detection(self, threshold: float = 0.5) -> dict:
         with self._scan_lock:
             if self._scan_status["state"] == "running":
                 return {"state": "busy", "message": "A scan is already running"}
-        self._update_status(state="running", message="Detecting duplicates\u2026", phase="detection")
+        self._update_status(state="running", message="Detecting duplicates\u2026", phase="detection", _start_time=time.time())
         t = threading.Thread(
             target=self._run_detection_background, args=(threshold,), daemon=True,
         )
@@ -628,9 +645,13 @@ class CatalogScanner:
 
     def _run_detection_background(self, threshold: float):
         try:
-            tables_missing_cols = not any(t.columns for t in self._tables)
-            if tables_missing_cols:
-                self._update_status(message="Loading column metadata\u2026")
+            t0 = time.time()
+
+            cols_loaded = sum(1 for t in self._tables if t.columns)
+            if cols_loaded < len(self._tables) * 0.9:
+                self._update_status(
+                    message=f"Loading column metadata ({cols_loaded}/{len(self._tables)} loaded)\u2026"
+                )
                 self.bulk_load_columns()
 
             from server.duplicates import detect_duplicates
@@ -647,16 +668,24 @@ class CatalogScanner:
                 "downstream_map": self._downstream_map,
                 "consumer_counts": self._consumer_counts,
                 "column_lineage_map": self._column_lineage_map,
+                "transitive_upstream": self._transitive_upstream,
             }
 
-            self._update_status(message="Comparing tables\u2026")
-            groups = detect_duplicates(self._tables, threshold=threshold, lineage=lineage_ctx)
+            self._update_status(message=f"Comparing tables\u2026")
+            def _detection_progress(msg, done, total):
+                if total > 0:
+                    self._update_status(message=f"{msg} ({done:,}/{total:,})")
+                else:
+                    self._update_status(message=msg)
+
+            groups = detect_duplicates(self._tables, threshold=threshold, lineage=lineage_ctx, progress_fn=_detection_progress)
             self._duplicate_groups = [g.to_dict() for g in groups]
 
+            elapsed = int(time.time() - t0)
             with self._scan_lock:
                 self._scan_status["state"] = "completed"
                 self._scan_status["message"] = (
-                    f"Detection complete \u2014 {len(self._duplicate_groups)} groups"
+                    f"Detection complete \u2014 {len(self._duplicate_groups)} groups ({elapsed}s)"
                 )
                 self._scan_status["result"] = {"groups_count": len(self._duplicate_groups)}
         except Exception as e:
@@ -666,10 +695,10 @@ class CatalogScanner:
                 self._scan_status["message"] = f"Detection failed: {e}"
                 self._scan_status["error"] = str(e)
 
-    # ── Bulk loading (fast startup from cache) ────────────────────────────
+    # \u2500\u2500 Bulk loading (fast startup from cache) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def _skip_catalogs_sql(self) -> str:
-        return ", ".join(f"\'{c}\'" for c in self._SKIP_CATALOG_NAMES)
+        return ", ".join(f"'{c}'" for c in self._SKIP_CATALOG_NAMES)
 
     def bulk_load_tables(self):
         src = self._METADATA_SOURCE
@@ -678,7 +707,7 @@ class CatalogScanner:
             f"SELECT table_catalog, table_schema, table_name, table_type, "
             f"       table_owner, comment, created, last_altered "
             f"FROM {src}.tables "
-            f"WHERE table_schema != \'information_schema\' "
+            f"WHERE table_schema != 'information_schema' "
             f"  AND table_catalog NOT IN ({skip}) "
             f"ORDER BY table_catalog, table_schema, table_name"
         )
@@ -712,8 +741,8 @@ class CatalogScanner:
                 f"SELECT table_schema, table_name, column_name, "
                 f"       full_data_type, ordinal_position, is_nullable, comment "
                 f"FROM {src}.columns "
-                f"WHERE table_catalog = \'{catalog}\' "
-                f"  AND table_schema != \'information_schema\' "
+                f"WHERE table_catalog = '{catalog}' "
+                f"  AND table_schema != 'information_schema' "
                 f"ORDER BY table_schema, table_name, ordinal_position",
                 quiet=True,
             )
@@ -740,7 +769,7 @@ class CatalogScanner:
         rows = self._run_sql(
             f"SELECT catalog_name, schema_name, schema_owner, comment "
             f"FROM {src}.schemata "
-            f"WHERE schema_name != \'information_schema\' "
+            f"WHERE schema_name != 'information_schema' "
             f"  AND catalog_name NOT IN ({skip}) "
             f"ORDER BY catalog_name, schema_name"
         )
@@ -760,7 +789,7 @@ class CatalogScanner:
             s.table_count = schema_counts.get(s.full_name, 0)
         logger.info(f"Bulk-loaded {len(self._schemas)} schemas")
 
-    # ── Lineage loading ───────────────────────────────────────────────────
+    # \u2500\u2500 Lineage loading \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def bulk_load_table_lineage(self):
         """Load distinct table-level lineage edges from the last 90 days."""
@@ -788,6 +817,7 @@ class CatalogScanner:
             for (s, t), e in raw_edges.items()
         ]
         self._build_lineage_lookups()
+        self._build_transitive_upstream()
 
         consumer_rows = self._run_sql(
             f"SELECT source_table_full_name, COUNT(DISTINCT entity_id) AS consumer_count "
@@ -803,9 +833,13 @@ class CatalogScanner:
             for row in consumer_rows:
                 self._consumer_counts[row[0].lower()] = int(row[1])
 
+        # Build transitive ancestor map (depth-capped BFS)
+        self._build_transitive_upstream()
+
         logger.info(
             f"Loaded {len(self._lineage_edges)} lineage edges, "
-            f"{len(self._consumer_counts)} tables with consumer counts"
+            f"{len(self._consumer_counts)} tables with consumer counts, "
+            f"{len(self._transitive_upstream)} tables with transitive ancestors"
         )
 
     def _build_lineage_lookups(self):
@@ -814,6 +848,107 @@ class CatalogScanner:
         for edge in self._lineage_edges:
             self._upstream_map[edge.target_table].add(edge.source_table)
             self._downstream_map[edge.source_table].add(edge.target_table)
+
+    def _build_transitive_upstream(
+        self, max_depth: int = 5, max_ancestors: int = 500,
+    ):
+        """Compute transitive ancestors for every table via depth-capped BFS.
+
+        Walks ``_upstream_map`` edges up to *max_depth* hops, storing the
+        shortest path depth to each ancestor.  Tables with fan-in above
+        the norm (hub tables) are capped at *max_ancestors* to prevent
+        memory/time blow-up.
+
+        Result is stored in ``_transitive_upstream``:
+            {table: {ancestor: min_depth, ...}}
+        """
+        self._update_status(message="Building transitive ancestry\u2026")
+        upstream = self._upstream_map
+        result: dict[str, dict[str, int]] = {}
+
+        for table in upstream:
+            ancestors: dict[str, int] = {}
+            visited: set[str] = {table}
+            queue: deque[tuple[str, int]] = deque()
+
+            # Seed with direct parents (depth 1)
+            for parent in upstream.get(table, ()):
+                if parent not in visited:
+                    queue.append((parent, 1))
+                    visited.add(parent)
+
+            while queue:
+                node, depth = queue.popleft()
+
+                # Record this ancestor at the shortest depth seen
+                if node not in ancestors or depth < ancestors[node]:
+                    ancestors[node] = depth
+
+                # Stop expanding if we've hit the caps
+                if len(ancestors) >= max_ancestors:
+                    break
+                if depth >= max_depth:
+                    continue
+
+                # Expand to grandparents
+                for grandparent in upstream.get(node, ()):
+                    if grandparent not in visited:
+                        visited.add(grandparent)
+                        queue.append((grandparent, depth + 1))
+
+            if ancestors:
+                result[table] = ancestors
+
+        self._transitive_upstream = result
+        logger.info(
+            f"Transitive upstream: {len(result)} tables, "
+            f"avg {sum(len(v) for v in result.values()) / max(len(result), 1):.1f} "
+            f"ancestors/table"
+        )
+
+
+    def _build_transitive_upstream(self, max_depth: int = 3, max_ancestors: int = 200):
+        """Compute transitive ancestors for every table via depth-capped BFS.
+
+        Walks ``_upstream_map`` edges up to *max_depth* hops.  For each table
+        stores ``{ancestor_table: shortest_path_depth}``.  Hub tables (with
+        very high fan-in) are capped at *max_ancestors* to avoid explosion.
+        """
+        from collections import deque
+
+        self._transitive_upstream = {}
+        upstream = self._upstream_map
+
+        for table in upstream:
+            ancestors: dict[str, int] = {}
+            queue: deque[tuple[str, int]] = deque()
+
+            # Seed with direct parents (depth 1)
+            for parent in upstream.get(table, set()):
+                if parent != table:
+                    ancestors[parent] = 1
+                    queue.append((parent, 1))
+
+            # BFS up the graph
+            while queue and len(ancestors) < max_ancestors:
+                current, depth = queue.popleft()
+                if depth >= max_depth:
+                    continue
+                for grandparent in upstream.get(current, set()):
+                    if grandparent == table:
+                        continue
+                    existing = ancestors.get(grandparent)
+                    if existing is None or depth + 1 < existing:
+                        ancestors[grandparent] = depth + 1
+                        queue.append((grandparent, depth + 1))
+
+            if ancestors:
+                self._transitive_upstream[table] = ancestors
+
+        logger.info(
+            f"Transitive upstream: {len(self._transitive_upstream)} tables "
+            f"with ancestors (max_depth={max_depth})"
+        )
 
     def bulk_load_column_lineage(self):
         """No-op: column lineage is loaded on demand via query_column_lineage().
@@ -831,7 +966,7 @@ class CatalogScanner:
         """Query column-level lineage between two specific tables (on demand).
 
         Returns a list of {source_table, source_col, target_table, target_col}
-        dicts for both directions (A→B and B→A).
+        dicts for both directions (A\u2192B and B\u2192A).
         """
         src = self._METADATA_SOURCE
         a_escaped = table_a.replace("'", "''")
@@ -880,18 +1015,26 @@ class CatalogScanner:
         return list(self._lineage_edges)
 
     @property
+    def transitive_upstream(self) -> dict[str, dict[str, int]]:
+        return dict(self._transitive_upstream)
+
+    @property
     def column_lineage_map(self) -> dict[tuple[str, str], list[tuple[str, str]]]:
         return dict(self._column_lineage_map)
 
-    # ── Single-table loaders ──────────────────────────────────────────────
+    @property
+    def transitive_upstream(self) -> dict[str, dict[str, int]]:
+        return dict(self._transitive_upstream)
+
+    # \u2500\u2500 Single-table loaders \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
     def load_table_columns(self, catalog: str, schema: str, name: str) -> list[ColumnInfo]:
         src = self._METADATA_SOURCE
         rows = self._run_sql(
             f"SELECT column_name, full_data_type, ordinal_position, is_nullable, comment "
             f"FROM {src}.columns "
-            f"WHERE table_catalog = \'{catalog}\' AND table_schema = \'{schema}\' "
-            f"  AND table_name = \'{name}\' ORDER BY ordinal_position"
+            f"WHERE table_catalog = '{catalog}' AND table_schema = '{schema}' "
+            f"  AND table_name = '{name}' ORDER BY ordinal_position"
         )
         if not rows:
             return []
