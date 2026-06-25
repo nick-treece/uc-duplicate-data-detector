@@ -997,6 +997,24 @@ function renderDupGroupCard(g) {
         }).join('')}
       </div>
       ${g.gold_standard ? `<div style="margin-top:8px"><span class="gold-badge">\u2605 Gold Standard: ${g.gold_standard}</span></div>` : ''}
+      ${(function() {
+        const li = g.lineage_info;
+        if (!li || !li.deepest_common_ancestor) return '';
+        const ancShort = li.deepest_common_ancestor.split('.').slice(1).join('.');
+        const depthVals = Object.values(li.pipeline_depths || {}).filter(v => v != null);
+        const depthRange = depthVals.length
+          ? (Math.min(...depthVals) === Math.max(...depthVals)
+              ? `${Math.min(...depthVals)} hop${Math.min(...depthVals) !== 1 ? 's' : ''}`
+              : `${Math.min(...depthVals)}–${Math.max(...depthVals)} hops`)
+          : '';
+        const covPct = Math.round((li.lineage_coverage || 0) * 100);
+        const covColor = covPct >= 80 ? 'var(--green)' : covPct >= 50 ? 'var(--yellow)' : 'var(--text-muted)';
+        return `<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px;color:var(--text-muted)">
+          <span title="Closest ancestor shared by all tables in this group">&#128279; Common source: <strong style="color:var(--text)">${ancShort}</strong>${depthRange ? ` &mdash; ${depthRange}` : ''}</span>
+          <span title="Fraction of tables with lineage data" style="color:${covColor}">&#9681; ${covPct}% lineage coverage</span>
+        </div>`;
+      })()}
+
       <details style="margin-top:12px">
         <summary style="cursor:pointer;font-size:12px;color:var(--text-muted);user-select:none;padding:4px 0">
           Show ${g.pairs.length} pair${g.pairs.length !== 1 ? 's' : ''}

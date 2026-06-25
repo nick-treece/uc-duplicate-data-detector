@@ -90,57 +90,38 @@ Currently, `_build_candidate_pairs()` only groups tables by name tokens. Tables 
 
 ---
 
-## Enhancement 3: Interactive Lineage Visualisation
+## Enhancement 3: Interactive Lineage Visualisation ✅
 
-**Goal:** Render the lineage subgraph connecting two compared tables on the Compare page, showing how they relate through shared ancestors, direct flows, and intermediate pipeline stages.
+**Status:** Deployed
 
-**Technology choice: D3.js + dagre (DAG layout)**
+The Compare page now renders the lineage subgraph connecting two compared tables — showing how they relate through shared ancestors, direct flows, and intermediate pipeline stages.
 
-| Option | Pros | Cons | Verdict |
-|---|---|---|---|
-| **Mermaid.js** | Simplest integration (text → SVG), no code | No interactivity, no click-to-expand, fixed layout | MVP only |
-| **D3.js + dagre** | Full control over layout, interactive (hover, click, zoom), best for DAGs | More code, CDN dependency | **Recommended** |
-| **Elkjs** | Best automatic layout quality | Heavy library (\~200KB), complex API | Over-engineered |
-| **Vis.js Network** | Easy force-directed graphs | Not ideal for directed acyclic graphs (lineage is a DAG) | Poor fit |
+**Technology:** D3.js + dagre (loaded from CDN in `index.html`). No build step required.
 
-**Implementation plan:**
+**What was implemented:**
 
-1. **New API endpoint:** `GET /api/compare/lineage-graph/{cat1}/{s1}/{t1}/{cat2}/{s2}/{t2}`
-   - Returns a JSON graph: `{nodes: [{id, label, tier, is_target}], edges: [{source, target, entity_types}]}`
-   - Computes the **connecting subgraph**: start from both tables, walk upstream (BFS, max depth 5), collect all nodes and edges on paths that connect them through shared ancestors
-   - Prune disconnected branches (nodes that don't lead to a shared ancestor)
-   - Cap at 100 nodes to keep the visualisation readable
+1. **API endpoint** (`GET /api/compare/lineage-graph/{cat1}/{s1}/{t1}/{cat2}/{s2}/{t2}`) — returns `{nodes, edges}` for the connecting subgraph. BFS upstream from both tables, prunes branches that don't connect through shared ancestors, caps at 100 nodes.
 
-2. **Frontend: D3-dagre renderer**
-   - Load `d3` and `dagre-d3` from CDN (no build step needed, \~60KB total)
-   - Left-to-right DAG layout (sources on left, targets on right)
-   - Node colouring by medallion tier (bronze/silver/gold) or catalog
-   - The two compared tables highlighted with accent border
-   - Shared ancestors highlighted with a distinct colour
-   - Edges labelled with entity types (JOB, NOTEBOOK, DBSQL_QUERY)
-   - Hover: show full table name, consumer count, depth from each target
-   - Click: navigate to that table's detail page in the Catalog Explorer
-
-3. **Frontend: placement on Compare page**
-   - New expandable section "Lineage Graph" below the existing lineage lists
-   - Collapsed by default (graph is loaded on-demand when expanded to avoid unnecessary API calls)
-   - Zoomable/pannable SVG container with a reset-zoom button
-
-**Estimated effort:** 2-3 days backend (subgraph extraction), 3-4 days frontend (D3-dagre renderer + interactivity).
+2. **Frontend renderer** (`renderDagreGraph` in `app.js`) — D3 + dagre layout with:
+   - Left-to-right DAG layout
+   - Node colouring: blue = compared table, purple = shared ancestor, dark = intermediate
+   - Tier indicator dots (gold/silver/bronze/copper) on each node
+   - Zoom/pan via D3 zoom
+   - Hover tooltip: full table name, tier, consumers, depth from each target
+   - Collapsible section ("Lineage Graph") — graph loads on-demand when expanded
 
 ---
 
-## Enhancement 4: Lineage Depth in Duplicate Group Cards
+## Enhancement 4: Lineage Depth in Duplicate Group Cards ✅
 
-Currently, duplicate group cards on the Duplicates page show tags (`pipeline_stage`, `shared_source`) but no lineage detail. With transitive upstream available, each group card could show:
+**Status:** Deployed
 
-- **Deepest common ancestor** — the table that is the root source for all members of the group
-- **Pipeline depth** — number of hops from the common ancestor to each member
-- **Lineage confidence** — percentage of group members that have any lineage data at all
+Duplicate group cards now show:
 
-This gives users immediate context about *why* tables are grouped without needing to open the compare page.
+- **Common source** — `schema.table` of the closest ancestor shared by all tables in the group, with the hop range (e.g. "2–3 hops")
+- **Lineage coverage** — percentage of group members that have transitive upstream data, colour-coded green/yellow/grey
 
-**Estimated effort:** 0.5 day backend, 0.5 day frontend.
+Implemented via `_compute_group_lineage_info()` in `duplicates.py`, called in Phase 5b of `detect_duplicates()`. The `lineage_info` dict is serialised into each group's cached dict.
 
 ---
 
@@ -152,8 +133,8 @@ This gives users immediate context about *why* tables are grouped without needin
 | 2 | Enhanced lineage scoring in detection | 1 day | Step 1 | ✅ Deployed (part of E1) |
 | 3 | Shared ancestors on compare page | 0.5 day | Step 1 | ✅ Deployed (part of E1) |
 | 4 | Lineage-based candidate discovery | 1 day | Step 1 | ✅ Deployed |
-| 5 | Lineage depth in group cards | 1 day | Steps 1-2 | Not started |
-| 6 | Lineage graph API endpoint | 2-3 days | Step 1 | Not started |
-| 7 | D3-dagre visualisation | 3-4 days | Step 6 | Not started |
+| 5 | Lineage depth in group cards | 1 day | Steps 1-2 | ✅ Deployed |
+| 6 | Lineage graph API endpoint | 2-3 days | Step 1 | ✅ Deployed |
+| 7 | D3-dagre visualisation | 3-4 days | Step 6 | ✅ Deployed |
 
-Steps 1-4 are deployed and delivering analytical value. Steps 5 adds lineage context to group cards. Steps 6-7 (the visualisation) are the most effort but also the most impactful for user understanding.
+**All 7 enhancements are complete.**
