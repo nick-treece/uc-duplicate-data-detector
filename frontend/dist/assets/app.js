@@ -31,9 +31,14 @@ let state = {
     schemaPrefixMode: 'any',
     tableTypes: [],
     ownerFilter: '',
+    onlyDeadDuplicates: false,
   },
   sortBy: 'score',
   compactView: false,
+  duplicatesTab: 'groups',
+  schemaGroups: null,   // null = not loaded, [] = loaded
+  schemasCompact: false,
+  schemasThreshold: 0.7,
   groupsPageSize: 50,
   groupsShown: 50,
   cacheLoading: true,   // true during initial cache check on startup
@@ -234,6 +239,9 @@ function applyGroupFilters(groups) {
     if (state.filters.ownerFilter && g.owners?.length) {
       if (!g.owners.includes(state.filters.ownerFilter)) return false;
     }
+
+    if (state.filters.onlyDeadDuplicates && !(g.dead_duplicates?.length > 0))
+      return false;
 
     if (state.filters.catalogPrefix) {
       const prefix = state.filters.catalogPrefix.toLowerCase();
@@ -643,6 +651,7 @@ function renderFilterSummary() {
   if (f.minGroupSize > 2)      chips.push({ label: `Min size: ${f.minGroupSize}`, key: 'minGroupSize',      value: 2 });
   if (f.searchQuery)           chips.push({ label: `Search: "${f.searchQuery}"`,  key: 'searchQuery',       value: '' });
   if (f.catalogPrefix)         chips.push({ label: `Prefix: ${f.catalogPrefix}`,  key: 'catalogPrefix',     value: '' });
+  if (f.onlyDeadDuplicates)        chips.push({ label: 'Safe to deprecate only', key: 'onlyDeadDuplicates', value: false });
   if (f.minScore > 0)              chips.push({ label: `Min score: ${f.minScore}%`,     key: 'minScore',     value: 0 });
   if (f.maxScore < 100)            chips.push({ label: `Max score: ${f.maxScore}%`,     key: 'maxScore',     value: 100 });
   if (f.schemaPrefix)              chips.push({ label: `Schema: ${f.schemaPrefix}`,      key: 'schemaPrefix', value: '' });
@@ -665,6 +674,490 @@ function renderFilterSummary() {
     </div>`;
 }
 
+function renderHeatmap() {
+  // Aggregate: for each cross-catalog pair, count how many groups span both
+  const matrix = {};
+  const catalogSet = new Set();
+
+  for (const g of state.groups) {
+    const cats = [...new Set(g.tables.map(t => t.split('.')[0]))];
+    cats.forEach(c => catalogSet.add(c));
+    for (let i = 0; i < cats.length; i++) {
+      for (let j = i + 1; j < cats.length; j++) {
+        const key = [cats[i], cats[j]].sort().join('|||');
+        matrix[key] = (matrix[key] || 0) + 1;
+      }
+    }
+  }
+
+  const catalogs = [...catalogSet].sort();
+  const maxVal = Math.max(1, ...Object.values(matrix));
+
+  const tabNav = buildDupTabNav();
+  const headerCells = catalogs.map(c => `<th style="font-size:10px;padding:4px 6px;writing-mode:vertical-rl;text-align:left;max-width:24px;overflow:hidden;color:var(--text-muted)">${c.split('_').slice(-2).join('_')}</th>`).join('');
+  const rows = catalogs.map(rowCat => {
+    const cells = catalogs.map(colCat => {
+      if (rowCat === colCat) return `<td style="background:var(--bg-secondary);opacity:0.3"></td>`;
+      const key = [rowCat, colCat].sort().join('|||');
+      const val = matrix[key] || 0;
+      if (!val) return `<td style="background:var(--bg-secondary)"></td>`;
+      const intensity = Math.round((val / maxVal) * 200);
+      return `<td style="background:rgba(239,68,68,${val/maxVal*0.8});text-align:center;font-size:11px;font-weight:600;cursor:pointer;color:#fff" title="${rowCat} ↔ ${colCat}: ${val} group${val!==1?'s':''}">${val}</td>`;
+    }).join('');
+    const shortName = rowCat.split('_').slice(-2).join('_');
+    return `<tr><td style="font-size:11px;padding:4px 8px;white-space:nowrap;color:var(--text-muted)">${shortName}</td>${cells}</tr>`;
+  }).join('');
+
+  main().innerHTML = `
+    <h2 class="page-title">Duplicate Detection</h2>
+    ${tabNav}
+    <div class="card" style="padding:16px;overflow-x:auto">
+      <div style="font-weight:600;font-size:13px;margin-bottom:4px">Cross-catalog duplication heatmap</div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Each cell shows the number of duplicate groups spanning both catalogs. Darker = more duplication.</div>
+      ${catalogs.length < 2 ? '<div class="empty-state"><p>Not enough catalogs for a heatmap.</p></div>' : `
+        <table style="border-collapse:collapse;font-size:12px">
+          <thead><tr><th></th>${headerCells}</tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`}
+    </div>`;
+}
+
+function renderOwnerSummary() {
+  // Build table→owner lookup
+  const tableOwner = {};
+  (state.tables || []).forEach(t => { if (t.owner) tableOwner[t.full_name || `${t.catalog}.${t.schema}.${t.name}`] = t.owner; });
+
+  // Aggregate: for each (owner, catalog) pair count cross-catalog dup groups
+  const counts = {};
+  for (const g of state.groups) {
+    const groupCatalogs = new Set(g.tables.map(t => t.split('.')[0]));
+    if (groupCatalogs.size < 2) continue;
+    for (const tbl of g.tables) {
+      const owner = tableOwner[tbl] || 'Unknown';
+      const catalog = tbl.split('.')[0];
+      const key = `${owner}|||${catalog}`;
+      if (!counts[key]) counts[key] = { owner, catalog, groups: 0, tables: new Set() };
+      counts[key].groups++;
+      counts[key].tables.add(tbl);
+    }
+  }
+
+  const rows = Object.values(counts)
+    .map(r => ({ ...r, tableCount: r.tables.size }))
+    .sort((a, b) => b.groups - a.groups);
+
+  const tabNav = buildDupTabNav();
+  const tableRows = rows.map(r =>
+    `<tr>
+      <td style="font-weight:500">${r.owner}</td>
+      <td style="font-size:12px;color:var(--text-muted)">${r.catalog}</td>
+      <td style="text-align:center">${r.groups}</td>
+      <td style="text-align:center">${r.tableCount}</td>
+    </tr>`).join('');
+
+  main().innerHTML = `
+    <h2 class="page-title">Duplicate Detection</h2>
+    ${tabNav}
+    <div class="card" style="padding:16px">
+      <div style="font-weight:600;font-size:13px;margin-bottom:4px">Owner × catalog duplication summary</div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Cross-catalog duplicate groups per owner and catalog. Only groups spanning 2+ catalogs are counted.</div>
+      ${rows.length ? `
+        <table class="data-table">
+          <thead><tr><th>Owner</th><th>Catalog</th><th>Dup groups</th><th>Tables with dups</th></tr></thead>
+          <tbody>${tableRows}</tbody>
+        </table>` : '<div class="empty-state"><p>No cross-catalog duplicates found.</p></div>'}
+    </div>`;
+}
+
+function buildDupTabNav() {
+  return `<div style="display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0">
+    ${['groups','heatmap','owners','schemas','info'].map(t => `
+      <button onclick="state.duplicatesTab='${t}';renderDuplicates()" style="padding:7px 16px;font-size:13px;font-weight:${state.duplicatesTab===t?'600':'400'};border:none;background:none;cursor:pointer;color:${state.duplicatesTab===t?'var(--accent)':'var(--text-muted)'};border-bottom:2px solid ${state.duplicatesTab===t?'var(--accent)':'transparent'};margin-bottom:-1px">
+        ${{groups:'Groups',heatmap:'Heatmap',owners:'Owners',schemas:'Schemas',info:'Info'}[t]}
+      </button>`).join('')}
+  </div>`;
+}
+
+async function renderSchemaGroups() {
+  const tabNav  = buildDupTabNav();
+  const threshold = state.schemasThreshold;
+
+  // Loading state on first visit (or after refresh)
+  if (state.schemaGroups === null) {
+    main().innerHTML = `
+      <h2 class="page-title">Duplicate Detection</h2>
+      ${tabNav}
+      <div id="schema-groups-content">${loading('Detecting schema duplicates\u2026')}</div>`;
+    try {
+      const data = await API.getSchemaGroups(threshold);
+      state.schemaGroups = data.groups || [];
+    } catch (e) {
+      main().innerHTML = `
+        <h2 class="page-title">Duplicate Detection</h2>
+        ${tabNav}
+        <div class="empty-state"><h3>Schema detection failed</h3><p>${e.message}</p></div>`;
+      return;
+    }
+    renderSchemaGroups();
+    return;
+  }
+
+  const groups = state.schemaGroups;
+
+  // ── Toolbar ──────────────────────────────────────────────────────────────
+  const toolbar = `
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
+      <span style="font-size:13px;color:var(--text-muted)">
+        <strong>${groups.length}</strong> schema pair${groups.length !== 1 ? 's' : ''}
+        with &ge;${(threshold * 100).toFixed(0)}% table-name overlap
+      </span>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-muted)">
+        Threshold
+        <input type="number" id="schema-threshold" min="0.1" max="1" step="0.05"
+          value="${threshold}"
+          style="width:60px;padding:3px 6px;font-size:13px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text)"
+          title="Lower = more pairs; press Enter to reload" />
+      </label>
+      <button class="btn btn-outline btn-sm" onclick="state.schemaGroups=null;renderDuplicates()">Refresh</button>
+      <button class="btn btn-outline btn-sm" id="schema-compact-toggle"
+        style="${state.schemasCompact ? 'background:var(--accent-soft);border-color:var(--accent)' : ''}">
+        ${state.schemasCompact ? 'Card view' : 'Compact view'}
+      </button>
+    </div>`;
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  main().innerHTML = `
+    <h2 class="page-title">Duplicate Detection</h2>
+    ${tabNav}
+    ${toolbar}
+    <div id="schema-groups-list">
+      ${groups.length
+        ? (state.schemasCompact ? renderSchemaCompact(groups) : groups.map(renderSchemaCard).join(''))
+        : '<div class="empty-state"><h3>No schema duplicates found</h3><p>Try lowering the threshold.</p></div>'
+      }
+    </div>`;
+
+  // ── Event handlers ────────────────────────────────────────────────────────
+  const compactBtn = document.getElementById('schema-compact-toggle');
+  if (compactBtn) compactBtn.onclick = () => {
+    state.schemasCompact = !state.schemasCompact;
+    renderSchemaGroups();
+  };
+
+  const threshInput = document.getElementById('schema-threshold');
+  if (threshInput) threshInput.onchange = () => {
+    const v = parseFloat(threshInput.value);
+    if (!isNaN(v) && v >= 0.1 && v <= 1.0) {
+      state.schemasThreshold = v;
+      state.schemaGroups = null;
+      renderDuplicates();
+    }
+  };
+}
+
+
+function _catalogBadge(fullSchema) {
+  const catalog = fullSchema.split('.')[0];
+  const tierColors = { gold: '#f59e0b', silver: '#94a3b8', bronze: '#d97706', copper: '#b45309' };
+  const tier  = Object.keys(tierColors).find(t => catalog.toLowerCase().includes(t));
+  const color = tier ? tierColors[tier] : '#6366f1';
+  return `<span style="display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:600;background:${color}22;color:${color};border:1px solid ${color}44;vertical-align:middle">${catalog}</span>`;
+}
+
+
+function renderSchemaCard(g) {
+  const catA    = g.schema_a.split('.')[0];
+  const nameA   = g.schema_a.split('.').slice(1).join('.');
+  const catB    = g.schema_b.split('.')[0];
+  const nameB   = g.schema_b.split('.').slice(1).join('.');
+  const sameCat = catA === catB;
+
+  const tableSim  = (g.table_similarity  * 100).toFixed(0);
+  const colSim    = (g.column_similarity * 100).toFixed(0);
+  const tSimColor = similarityColor(g.table_similarity);
+  const cSimColor = similarityColor(g.column_similarity);
+
+  const sharedChips = g.shared_tokens.map(t =>
+    `<span class="tag tag-accent" style="font-size:11px">${t}</span>`
+  ).join(' ');
+
+  const onlyAChips = (g.only_a || []).map(t =>
+    `<span class="tag" style="font-size:11px;background:var(--accent-soft)">${t}</span>`
+  ).join(' ');
+  const onlyBChips = (g.only_b || []).map(t =>
+    `<span class="tag" style="font-size:11px;background:var(--bg-secondary)">${t}</span>`
+  ).join(' ');
+
+  const hasDiff = (g.only_a?.length || 0) + (g.only_b?.length || 0) > 0;
+
+  return `
+    <div class="dup-group" style="margin-bottom:14px">
+      <div class="dup-group-header" style="align-items:flex-start">
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span style="display:flex;align-items:center;gap:6px">
+            ${_catalogBadge(g.schema_a)}
+            <strong style="font-size:13px">${nameA}</strong>
+          </span>
+          <span style="color:var(--text-muted);font-size:13px">\u2194</span>
+          <span style="display:flex;align-items:center;gap:6px">
+            ${_catalogBadge(g.schema_b)}
+            <strong style="font-size:13px">${nameB}</strong>
+          </span>
+          ${sameCat ? '<span class="tag" style="font-size:10px;opacity:0.7">same catalog</span>' : ''}
+        </div>
+        <div style="display:flex;gap:14px;align-items:center;flex-shrink:0">
+          <span style="font-size:12px;color:var(--text-muted)">
+            <span style="color:${tSimColor};font-weight:600">${tableSim}%</span> tables
+          </span>
+          <span style="font-size:12px;color:var(--text-muted)">
+            <span style="color:${cSimColor};font-weight:600">${colSim}%</span> columns
+          </span>
+        </div>
+      </div>
+
+      <div class="similarity-bar" style="margin:8px 0">
+        <div class="similarity-bar-fill" style="width:${tableSim}%;background:${tSimColor}"></div>
+      </div>
+
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
+        ${g.table_count_a} tables in <strong>${nameA}</strong>
+        &nbsp;&nbsp;\u2194&nbsp;&nbsp;
+        ${g.table_count_b} tables in <strong>${nameB}</strong>
+      </div>
+
+      ${sharedChips ? `
+        <div style="margin-bottom:8px">
+          <span style="font-size:11px;color:var(--text-muted);margin-right:6px">Shared:</span>
+          ${sharedChips}
+        </div>` : ''}
+
+      ${hasDiff ? `
+        <details style="margin-top:6px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--text-muted);user-select:none;padding:2px 0">
+            Differences (${(g.only_a?.length||0) + (g.only_b?.length||0)} unique tokens)
+          </summary>
+          <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+            ${onlyAChips ? `<div><span style="font-size:11px;color:var(--text-muted);margin-right:6px">Only in ${nameA}:</span>${onlyAChips}</div>` : ''}
+            ${onlyBChips ? `<div><span style="font-size:11px;color:var(--text-muted);margin-right:6px">Only in ${nameB}:</span>${onlyBChips}</div>` : ''}
+          </div>
+        </details>` : ''}
+    </div>`;
+}
+
+
+function renderSchemaCompact(groups) {
+  const rows = groups.map(g => {
+    const nameA  = g.schema_a.split('.').slice(1).join('.');
+    const nameB  = g.schema_b.split('.').slice(1).join('.');
+    const tColor = similarityColor(g.table_similarity);
+    const cColor = similarityColor(g.column_similarity);
+    return `<tr>
+      <td title="${g.schema_a}">${_catalogBadge(g.schema_a)} <span style="font-size:12px">${nameA}</span></td>
+      <td title="${g.schema_b}">${_catalogBadge(g.schema_b)} <span style="font-size:12px">${nameB}</span></td>
+      <td style="text-align:center;font-weight:600;color:${tColor}">${(g.table_similarity*100).toFixed(0)}%</td>
+      <td style="text-align:center;font-weight:600;color:${cColor}">${(g.column_similarity*100).toFixed(0)}%</td>
+      <td style="text-align:center;color:var(--text-muted)">${g.table_count_a} / ${g.table_count_b}</td>
+      <td style="font-size:11px">${(g.shared_tokens||[]).slice(0,5).map(t=>`<span class="tag tag-accent" style="font-size:10px">${t}</span>`).join(' ')}${g.shared_tokens?.length>5?` <span style="color:var(--text-muted)">+${g.shared_tokens.length-5}</span>`:''}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <table class="data-table">
+      <thead><tr>
+        <th>Schema A</th><th>Schema B</th>
+        <th>Table sim</th><th>Col sim</th>
+        <th>Tables A/B</th><th>Shared tokens</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+
+function renderDupInfo() {
+  const tabNav = buildDupTabNav();
+  main().innerHTML = `
+    <h2 class="page-title">Duplicate Detection</h2>
+    ${tabNav}
+    <div style="max-width:860px;display:flex;flex-direction:column;gap:16px">
+
+      <div class="card" style="padding:18px 20px">
+        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Groups</div>
+        <p style="font-size:13px;color:var(--text-muted);line-height:1.6;margin:0">
+          The main view. Each card represents a cluster of tables whose column structures are
+          similar enough to be potential duplicates. Cards show the tables in the group, the
+          <strong>gold-standard</strong> recommendation (&#11088; star), a similarity score,
+          lineage information where available, and tags that explain why the group was flagged.
+        </p>
+        <div style="margin-top:10px;display:flex;flex-direction:column;gap:6px;font-size:12px">
+          <div><strong>Composite score</strong> — weighted average of four signals:
+            column overlap (40%), type compatibility (25%), name similarity (15%), lineage score (20%).
+            Groups only appear if at least one pair exceeds the detection threshold (default 0.5).</div>
+          <div><strong>&#11088; Gold standard</strong> — the table the engine recommends keeping.
+            Scored on consumer count, medallion tier, table type (TABLE &gt; VIEW &gt; EXTERNAL),
+            and upstream lineage depth. Higher consumer count and gold/silver tier score highest.</div>
+          <div><strong>&#9851;&#65039; Dead duplicate badge</strong> — a non-gold table with zero
+            downstream consumers. Nothing reads it, making it the safest candidate to deprecate.
+            Use the <em>Safe to deprecate only</em> filter to surface these groups exclusively.</div>
+          <div><strong>&#128279; Common source</strong> — the closest ancestor shared by all tables
+            in the group, with the hop range. A group where all tables trace back to the same
+            bronze source 2–3 hops away is almost certainly a pipeline-stage group rather than
+            an actionable duplicate.</div>
+          <div><strong>Tags</strong> — <em>pipeline_stage</em>: tables form a direct lineage chain
+            or span medallion tiers. <em>governance_view</em>: a VIEW whose columns are a subset
+            of a paired TABLE. <em>shared_source</em>: all tables share a common immediate upstream.
+            These groups are typically informational rather than requiring cleanup.</div>
+        </div>
+      </div>
+
+      <div class="card" style="padding:18px 20px">
+        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Heatmap</div>
+        <p style="font-size:13px;color:var(--text-muted);line-height:1.6;margin:0">
+          A catalog &times; catalog matrix showing where cross-catalog duplication is concentrated.
+          Each cell shows the number of duplicate groups that span both catalogs — darker red means
+          more duplication. The diagonal is empty (same-catalog groups are not shown). Use this
+          to identify which catalog boundaries have the highest redundancy at a glance, without
+          reading individual group cards.
+        </p>
+      </div>
+
+      <div class="card" style="padding:18px 20px">
+        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Owners</div>
+        <p style="font-size:13px;color:var(--text-muted);line-height:1.6;margin:0">
+          A breakdown of cross-catalog duplication by data owner and catalog. For each
+          (owner, catalog) pair, the table shows how many duplicate groups involve their tables
+          and how many distinct tables of theirs are caught in cross-catalog groups. Sorted by
+          group count descending. Use this to prioritise remediation conversations — the top
+          rows identify which owners have the most to gain from clean-up.
+        </p>
+      </div>
+
+      <div class="card" style="padding:18px 20px">
+        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Schemas</div>
+        <p style="font-size:13px;color:var(--text-muted);line-height:1.6;margin:0">
+          Pairs of schemas (across different catalogs) with structurally similar table sets.
+          Similarity is measured as Jaccard overlap on normalised table-name tokens — a score of
+          70% or above means the two schemas share at least 70% of their distinctive table name
+          vocabulary. A high score often indicates copy-paste schema proliferation: the same
+          logical dataset reproduced in multiple catalogs through environment promotion or
+          ad-hoc ingestion. Results load on demand; use the <em>Refresh</em> button to recompute.
+        </p>
+        <div style="margin-top:10px;font-size:12px;display:flex;flex-direction:column;gap:4px">
+          <div><strong>Table similarity</strong> — Jaccard on normalised table name tokens (stop words like <em>raw</em>, <em>dim</em>, <em>fact</em> removed).</div>
+          <div><strong>Column similarity</strong> — Jaccard on canonical column names across all tables in each schema.</div>
+          <div><strong>Shared tokens</strong> — the name tokens the two schemas have in common, giving a quick sense of which logical entities overlap.</div>
+        </div>
+      </div>
+
+      <div class="card" style="padding:18px 20px">
+        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Filters &amp; controls (Groups tab)</div>
+        <div style="font-size:12px;color:var(--text-muted);display:flex;flex-direction:column;gap:5px">
+          <div><strong>Min group size</strong> — hide pairs (size 2) and surface only clusters of 3+ tables, which are higher-confidence duplicates.</div>
+          <div><strong>Cross-catalog only</strong> — show only groups spanning 2+ catalogs. These are almost always more architecturally significant than same-catalog groups.</div>
+          <div><strong>Score range</strong> — isolate high-confidence duplicates (&gt;80%) from borderline ones (50–65%) without re-running detection.</div>
+          <div><strong>Schema prefix / mode</strong> — filter by the schema segment of table names. <em>Any</em> = at least one table matches; <em>All</em> = every table in the group matches.</div>
+          <div><strong>Table type</strong> — show only groups containing TABLE, VIEW, or EXTERNAL tables.</div>
+          <div><strong>Owner</strong> — filter to groups where at least one table belongs to the selected owner.</div>
+          <div><strong>Safe to deprecate only</strong> — show only groups where at least one non-gold table has zero downstream consumers.</div>
+          <div><strong>Dismiss</strong> — hide a group from the default view. Dismissed groups are stored in browser localStorage and persist across sessions. Toggle <em>Show dismissed</em> to review them.</div>
+          <div><strong>Compact view</strong> — switch from cards to a dense single-row-per-group table for scanning large numbers of groups quickly.</div>
+        </div>
+      </div>
+
+    </div>`;
+}
+
+
+function renderDupInfo() {
+  const tabNav = buildDupTabNav();
+
+  const section = (title, body) => `
+    <div class="card" style="padding:20px;margin-bottom:16px">
+      <div style="font-weight:700;font-size:14px;margin-bottom:10px;color:var(--text)">${title}</div>
+      <div style="font-size:13px;color:var(--text-muted);line-height:1.6">${body}</div>
+    </div>`;
+
+  const badge = (txt, col) =>
+    `<span style="display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:600;background:${col}20;color:${col};border:1px solid ${col}40;vertical-align:middle">${txt}</span>`;
+
+  main().innerHTML = `
+    <h2 class="page-title">Duplicate Detection</h2>
+    ${tabNav}
+
+    ${section('How duplicate groups are detected',
+      `The detection engine compares every pair of tables that share at least one name token (e.g. two tables both containing the word <em>pupil</em>) across different schemas or catalogs.
+       Each pair receives a <strong>composite similarity score</strong> from four signals:
+       <table class="data-table" style="margin-top:10px;font-size:12px">
+         <thead><tr><th>Signal</th><th>Weight</th><th>What it measures</th></tr></thead>
+         <tbody>
+           <tr><td>Column overlap</td><td style="text-align:center">40%</td><td>Jaccard similarity of canonical column names (synonyms resolved, prefixes stripped)</td></tr>
+           <tr><td>Type compatibility</td><td style="text-align:center">25%</td><td>Fraction of shared columns whose types are compatible (e.g. INT and BIGINT both count)</td></tr>
+           <tr><td>Name similarity</td><td style="text-align:center">15%</td><td>Token-level Jaccard on the table name, ignoring common prefixes like <code>dim_</code>, <code>fact_</code></td></tr>
+           <tr><td>Lineage score</td><td style="text-align:center">20%</td><td>Weighted shared-ancestor score — higher when tables trace back to the same source through shallow paths</td></tr>
+         </tbody>
+       </table>
+       <div style="margin-top:10px">Groups with a maximum pair score below the detection threshold (default <strong>0.5</strong>) are excluded entirely.</div>`
+    )}
+
+    ${section('Groups tab',
+      `The main view. Each card represents a cluster of tables the engine considers likely duplicates.
+       <ul style="margin:8px 0 0 16px;padding:0">
+         <li style="margin-bottom:6px">${badge('⭐ Gold standard', '#f59e0b')} — The table the engine recommends keeping. Scored on: downstream consumer count, catalog tier (gold &gt; silver &gt; bronze &gt; copper), table type (TABLE &gt; VIEW &gt; EXTERNAL), and lineage depth.</li>
+         <li style="margin-bottom:6px">${badge('♻️ Zero consumers', '#10b981')} — A non-gold table with no downstream consumers in the last 90 days. Safe to deprecate — nothing reads it. Use the <strong>"Safe to deprecate only"</strong> filter to find all such groups at once.</li>
+         <li style="margin-bottom:6px">${badge('🔗 Common source', '#6366f1')} — The closest ancestor shared by all tables in the group, and the hop count from it to each member. High lineage coverage (green) means most tables have lineage data.</li>
+         <li style="margin-bottom:6px"><strong>Tags</strong> — <code>pipeline_stage</code> means a direct lineage edge exists between group members (expected duplication). <code>governance_view</code> means one member is a VIEW whose columns are a subset of a paired TABLE. <code>shared_source</code> means all members share a common direct parent.</li>
+         <li>Expand the <strong>pairs breakdown</strong> to see per-pair scores for each similarity signal.</li>
+       </ul>`
+    )}
+
+    ${section('Heatmap tab',
+      `A catalog × catalog matrix. Each cell shows how many duplicate groups span both catalogs.
+       Darker red means more cross-catalog duplication between that pair.
+       <ul style="margin:8px 0 0 16px;padding:0">
+         <li style="margin-bottom:4px">Use this to identify which catalog boundaries have the most redundancy — e.g. a migration from a copper catalog to a gold one that was never fully cleaned up.</li>
+         <li>Hover any cell for the exact count. Only cross-catalog groups are counted; same-catalog pairs appear on the diagonal (left empty).</li>
+       </ul>`
+    )}
+
+    ${section('Owners tab',
+      `A breakdown of cross-catalog duplication by owner and catalog. Shows how many duplicate groups and distinct tables each owner has across catalog boundaries.
+       <ul style="margin:8px 0 0 16px;padding:0">
+         <li style="margin-bottom:4px">Sort by <strong>Dup groups</strong> to find the owners with the most cross-catalog redundancy — these are the highest-priority remediation conversations.</li>
+         <li>Only cross-catalog groups (spanning 2+ catalogs) are counted here. Within-catalog duplication is excluded.</li>
+       </ul>`
+    )}
+
+    ${section('Schemas tab',
+      `Pairs of schemas across different catalogs with similar table structure, detected by comparing normalised table-name token sets using Jaccard similarity.
+       <ul style="margin:8px 0 0 16px;padding:0">
+         <li style="margin-bottom:4px"><strong>Table similarity</strong> — fraction of table name tokens shared between the two schemas (≥70% to appear here by default).</li>
+         <li style="margin-bottom:4px"><strong>Column similarity</strong> — fraction of canonical column names shared across all tables in both schemas. A high column sim alongside a high table sim is strong evidence of copy-paste schema proliferation.</li>
+         <li style="margin-bottom:4px"><strong>Shared tokens</strong> — the table name tokens both schemas have in common. Useful for understanding what the schemas represent.</li>
+         <li>Use the <strong>Refresh</strong> button to re-run detection. Lower the threshold in the URL (<code>?threshold=0.5</code>) to surface more pairs.</li>
+       </ul>`
+    )}
+
+    ${section('Filters reference',
+      `<table class="data-table" style="font-size:12px">
+         <thead><tr><th>Filter</th><th>What it does</th></tr></thead>
+         <tbody>
+           <tr><td>Hide governance views</td><td>Hides 2-table groups where a VIEW's columns are a subset of a paired TABLE — expected by design</td></tr>
+           <tr><td>Hide pipeline stages</td><td>Hides groups where a direct lineage edge exists between members, or all catalogs follow the medallion tier pattern</td></tr>
+           <tr><td>Hide shared-source groups</td><td>Hides groups where every member shares the same direct upstream parent</td></tr>
+           <tr><td>Cross-catalog only</td><td>Shows only groups that span at least two different catalogs</td></tr>
+           <tr><td>Safe to deprecate only</td><td>Shows only groups that contain at least one non-gold table with zero consumers</td></tr>
+           <tr><td>Min group size</td><td>Excludes groups smaller than N tables — raising this from 2 to 3 removes the noisiest pairs</td></tr>
+           <tr><td>Score range</td><td>Filters on the maximum composite score across all pairs in the group</td></tr>
+           <tr><td>Catalog prefix</td><td>Any mode: at least one table's catalog matches. All mode: every table's catalog matches</td></tr>
+           <tr><td>Schema prefix</td><td>Same as catalog prefix but matches the schema segment (<code>catalog.schema.table</code>)</td></tr>
+           <tr><td>Table type</td><td>Shows only groups containing at least one table of the selected type(s)</td></tr>
+           <tr><td>Owner</td><td>Shows only groups where at least one table is owned by the selected principal</td></tr>
+           <tr><td>Search</td><td>Free-text match against table names and group label (400 ms debounce)</td></tr>
+         </tbody>
+       </table>`
+    )}
+  `;
+}
+
 // ===== Duplicates =====
 async function renderDuplicates() {
   if (!state.scanned) {
@@ -678,9 +1171,24 @@ async function renderDuplicates() {
 
   const { filtered, total, hidden } = filteredGroupsInfo();
 
+  // Branch to sub-views
+  if (state.duplicatesTab === 'heatmap') { renderHeatmap(); return; }
+  if (state.duplicatesTab === 'owners')  { renderOwnerSummary(); return; }
+  if (state.duplicatesTab === 'schemas') { renderSchemaGroups(); return; }
+  if (state.duplicatesTab === 'info')    { renderDupInfo(); return; }
+
+  const tabNav = `
+    <div style="display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0">
+      ${['groups','heatmap','owners','schemas','info'].map(t => `
+        <button onclick="state.duplicatesTab='${t}';renderDuplicates()" style="padding:7px 16px;font-size:13px;font-weight:${state.duplicatesTab===t?'600':'400'};border:none;background:none;cursor:pointer;color:${state.duplicatesTab===t?'var(--accent)':'var(--text-muted)'};border-bottom:2px solid ${state.duplicatesTab===t?'var(--accent)':'transparent'};margin-bottom:-1px">
+          ${{groups:'Groups',heatmap:'Heatmap',owners:'Owners',schemas:'Schemas',info:'Info'}[t]}
+        </button>`).join('')}
+    </div>`;
+
   main().innerHTML = `
     <h2 class="page-title">Duplicate Detection</h2>
     <p class="page-desc">Tables across <strong>${(state.scanResult?.catalogs_scanned || []).length}</strong> catalog(s) grouped by similarity. The gold badge marks the recommended standard dataset.</p>
+    ${tabNav}
     <div class="threshold-control">
       <label>Similarity Threshold</label>
       <input type="range" id="threshold-slider" min="0.1" max="1.0" step="0.05" value="${state.threshold}" />
@@ -729,6 +1237,10 @@ async function renderDuplicates() {
             <option value="size"     ${state.sortBy === 'size'     ? 'selected' : ''}>Group size</option>
             <option value="catalogs" ${state.sortBy === 'catalogs' ? 'selected' : ''}>Catalog count</option>
           </select>
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="filter-dead" ${state.filters.onlyDeadDuplicates ? 'checked' : ''} />
+          Safe to deprecate only
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px">
           Score
@@ -796,6 +1308,7 @@ async function renderDuplicates() {
     state.filters.schemaPrefixMode = $('filter-schema-mode').value;
     state.filters.tableTypes   = [...document.querySelectorAll('.filter-type-cb:checked')].map(cb => cb.value);
     state.filters.ownerFilter  = $('filter-owner').value;
+    state.filters.onlyDeadDuplicates = $('filter-dead').checked;
     state.sortBy = $('sort-by').value;
     state.groupsShown = state.groupsPageSize;  // reset pagination on filter change
     renderDuplicates();
@@ -841,6 +1354,7 @@ async function renderDuplicates() {
     state.filters.schemaPrefixMode    = 'any';
     state.filters.tableTypes          = [];
     state.filters.ownerFilter         = '';
+    state.filters.onlyDeadDuplicates  = false;
     state.sortBy = 'score';
     state.groupsShown = state.groupsPageSize;
     renderDuplicates();
@@ -851,6 +1365,7 @@ async function renderDuplicates() {
     renderDuplicates();
   };
 
+  $('filter-dead').onchange = onFilterChange;
   $('filter-schema-mode').onchange = onFilterChange;
   $('filter-owner').onchange = onFilterChange;
   document.querySelectorAll('.filter-type-cb').forEach(cb => cb.onchange = onFilterChange);
@@ -992,8 +1507,9 @@ function renderDupGroupCard(g) {
       <div class="dup-tables-list" style="margin-top:10px">
         ${g.tables.map(t => {
           const isGold = t === g.gold_standard;
+          const isDead = g.dead_duplicates?.includes(t);
           const score = g.gold_scores[t];
-          return `<span class="dup-table-tag ${isGold ? 'gold' : ''}" title="Gold score: ${score ?? '\u2014'}">${isGold ? '\u2605 ' : ''}${t}</span>`;
+          return `<span class="dup-table-tag ${isGold ? 'gold' : ''}" title="Gold score: ${score ?? '\u2014'}">${isGold ? '\u2605 ' : ''}${t}${isDead ? ' <span style="font-size:10px;opacity:0.7" title="Zero consumers — safe to deprecate">♻️</span>' : ''}</span>`;
         }).join('')}
       </div>
       ${g.gold_standard ? `<div style="margin-top:8px"><span class="gold-badge">\u2605 Gold Standard: ${g.gold_standard}</span></div>` : ''}

@@ -248,6 +248,7 @@ class DuplicateGroup:
     table_types: list[str] = field(default_factory=list)  # e.g. ['TABLE', 'VIEW']
     owners: list[str] = field(default_factory=list)       # distinct owners across all tables
     lineage_info: dict = field(default_factory=dict)      # deepest_common_ancestor, pipeline_depths, lineage_coverage
+    dead_duplicates: list[str] = field(default_factory=list) # non-gold tables with zero consumers
 
     def to_dict(self):
         return {
@@ -261,6 +262,7 @@ class DuplicateGroup:
             "table_types": self.table_types,
             "owners": self.owners,
             "lineage_info": self.lineage_info,
+            "dead_duplicates": self.dead_duplicates,
         }
 
 
@@ -666,8 +668,15 @@ def detect_duplicates(
         cols_a = [c.name for c in ta.columns]
         cols_b = [c.name for c in tb.columns]
         col_sim = column_similarity(cols_a, cols_b)
-        typ_sim = type_similarity(ta, tb)
         nm_sim = name_similarity(ta.name, tb.name)
+
+        # Early exit: when col_sim == 0, typ_sim is also 0 (no shared columns).
+        # Max composite becomes nm_sim * name_weight + lin_weight ≤ 0.35,
+        # which is always below the default threshold of 0.5.
+        if col_sim == 0.0 and nm_sim * name_weight + lin_weight < threshold:
+            continue
+
+        typ_sim = type_similarity(ta, tb)
 
         # Per-pair lineage: only score if at least one table has lineage
         a_has = ta.full_name.lower() in tables_with_lineage
@@ -737,6 +746,14 @@ def detect_duplicates(
         group.owners = sorted({t.owner for t in infos if t.owner})
         group.lineage_info = _compute_group_lineage_info(group, transitive_upstream)
 
+        # Dead duplicates: non-gold tables with zero consumers (only when data exists)
+        cc = (lineage or {}).get("consumer_counts", {})
+        if cc and group.gold_standard:
+            group.dead_duplicates = [
+                t for t in group.tables
+                if t != group.gold_standard and cc.get(t.lower(), 0) == 0
+            ]
+
     # ── Phase 6: Tag groups for filtering ────────────────────────────
     if progress_fn:
         progress_fn(f"Tagging {len(groups):,} groups…", 0, 0)
@@ -765,6 +782,85 @@ def _derive_group_label(full_names: list[str]) -> str:
     shortest = min(short_names, key=len)
     return re.sub(r"[_\-]+", " ", shortest).title()
 
+
+
+def detect_schema_duplicates(
+    tables: list[TableInfo],
+    threshold: float = 0.7,
+    max_schemas: int = 5000,
+) -> list[dict]:
+    """Find pairs of schemas with similar table structure across different catalogs.
+
+    Uses the same name-token normalisation as table-level detection.
+    Compares schemas pairwise: Jaccard similarity on normalised table name tokens,
+    plus a secondary column-name overlap score.
+
+    Only cross-catalog pairs are returned.
+    """
+    from collections import defaultdict
+
+    # Group tables by schema (catalog.schema)
+    schema_tables: dict[str, list[TableInfo]] = defaultdict(list)
+    for t in tables:
+        schema_tables[f"{t.catalog}.{t.schema}"].append(t)
+
+    # Guard: skip if too many schemas to compare pairwise
+    if len(schema_tables) > max_schemas:
+        schema_tables = dict(list(schema_tables.items())[:max_schemas])
+
+    # Build fingerprints: normalised table name tokens + canonical column names
+    schema_list = sorted(schema_tables.keys())
+    table_tokens: dict[str, frozenset] = {}
+    col_tokens: dict[str, frozenset] = {}
+    for schema, tbls in schema_tables.items():
+        table_tokens[schema] = frozenset(
+            tok for t in tbls for tok in _tokenize_name(t.name)
+        )
+        col_tokens[schema] = frozenset(
+            _canonical_col(c.name)
+            for t in tbls for c in t.columns
+        )
+
+    # Pairwise comparison (cross-catalog only)
+    results = []
+    for i, a in enumerate(schema_list):
+        cat_a = a.split(".")[0]
+        fa = table_tokens[a]
+        if not fa:
+            continue
+        for b in schema_list[i + 1:]:
+            cat_b = b.split(".")[0]
+            if cat_a == cat_b:
+                continue  # only cross-catalog
+
+            fb = table_tokens[b]
+            if not fb:
+                continue
+
+            union = fa | fb
+            inter = fa & fb
+            table_sim = len(inter) / len(union)
+            if table_sim < threshold:
+                continue
+
+            ca, cb = col_tokens[a], col_tokens[b]
+            col_union = ca | cb
+            col_sim = len(ca & cb) / len(col_union) if col_union else 0.0
+
+            results.append({
+                "schema_a": a,
+                "schema_b": b,
+                "table_similarity": round(table_sim, 3),
+                "column_similarity": round(col_sim, 3),
+                "table_count_a": len(schema_tables[a]),
+                "table_count_b": len(schema_tables[b]),
+                "shared_tokens": sorted(inter)[:20],
+                "only_a": sorted(fa - fb)[:10],
+                "only_b": sorted(fb - fa)[:10],
+            })
+
+    results.sort(key=lambda x: x["table_similarity"], reverse=True)
+    return results
 
 def _cluster_pairs(
     pairs: list[DuplicatePair],

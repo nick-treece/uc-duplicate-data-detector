@@ -192,20 +192,20 @@
 # MAGIC | 10 | **Schema prefix filter** | None | Mirror the catalog prefix control but match `t.split('.')[1]` (the schema segment). Can share the same Any/All mode toggle. |
 # MAGIC | 11 | **Table type filter** | Group object needs `table_types` field | Add `table_types: list[str]` to the serialised group dict in `duplicates.py` (derived from `TableInfo.table_type`). Frontend: a multi-select toggle for TABLE / VIEW / EXTERNAL. |
 # MAGIC | 12 | **Owner filter** | Group object needs `owners` field | Add `owners: list[str]` to the group dict. Frontend: a dropdown populated dynamically from the distinct owners across all groups in `state.groups`. |
-# MAGIC | 13 | **Lineage depth badge on group cards** | Enhancement 4 in Lineage Plan (not yet started) | _Deferred — depends on Enhancement 4 in the Lineage Plan which has not yet been implemented._ |
+# MAGIC | 13 | **Lineage depth badge on group cards** | Lineage Enhancement Plan ✅ | Implemented as part of Lineage Enhancement 5. Group cards now show: closest common ancestor (`schema.table`), hop range (e.g. “2–3 hops”), and lineage coverage %. Displayed on all cards with lineage data — not restricted to tagged groups, as the data is useful regardless of tag. Populated via `_compute_group_lineage_info()` in `duplicates.py` Phase 5b; serialised into cached group dicts as `lineage_info`. |
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### Sprint 4 — High-Impact Detection and Visualisation
+# MAGIC ### Sprint 4 — ✅ Completed
 # MAGIC
-# MAGIC These address the root problem (too many groups) rather than making the existing list easier to navigate. Higher effort but highest long-term impact.
+# MAGIC All four items shipped.
 # MAGIC
-# MAGIC | # | Enhancement | Effort | Why now |
+# MAGIC | # | Enhancement | Status | Notes |
 # MAGIC |---|---|---|---|
-# MAGIC | 14 | **“Dead duplicate” detection** | Medium | Add a `has_dead_duplicate` flag to each group during scoring in `duplicates.py`. A dead duplicate is a non-gold table with zero entries in `_consumer_counts`. Surface a “Safe to deprecate?” badge on the card and add a filter toggle. Actionable immediately: these are the groups where cleanup carries zero risk. |
-# MAGIC | 15 | **Duplication heatmap** | Medium | A catalog × catalog matrix aggregated from `state.groups` — no new API needed. Add as a new “Heatmap” tab on the Duplicates page. Renders the full cross-catalog duplication picture in a single glance. |
-# MAGIC | 16 | **Owner × catalog summary table** | Medium | A pivot of `state.groups` × `state.tables` ownership data. Surfaces which owners have the most cross-catalog duplication. Useful for generating team-level remediation tasks. |
-# MAGIC | 17 | **Schema fingerprinting + schema duplicate groups** | High | New pass in `scanner.py` computing per-schema column fingerprints. New `/api/duplicates/schema-groups` endpoint. New sub-view on the Duplicates page. Result set is orders of magnitude smaller than table-level groups, making it the best long-term entry point for architectural review. |
+# MAGIC | 14 | **Dead duplicate detection** | ✅ | `dead_duplicates: list[str]` added to `DuplicateGroup` and `to_dict()`. Populated in Phase 5b: non-gold tables with zero `consumer_counts` (only when consumer data and a gold standard are present). Frontend: ♻️ badge on dead table chips; “Safe to deprecate only” filter checkbox, chip, and clear-all reset. |
+# MAGIC | 15 | **Duplication heatmap** | ✅ | New “Heatmap” tab on Duplicates page. `renderHeatmap()` aggregates `state.groups` into a catalog × catalog matrix (no new API). Cells coloured red-intensity by group count. Shared `buildDupTabNav()` helper renders Groups/Heatmap/Owners/Schemas tab bar. |
+# MAGIC | 16 | **Owner × catalog summary table** | ✅ | New “Owners” tab. `renderOwnerSummary()` pivots `state.groups` × `state.tables` ownership: cross-catalog dup groups and distinct tables per (owner, catalog) pair, sorted by count. |
+# MAGIC | 17 | **Schema fingerprinting + schema groups** | ✅ | `detect_schema_duplicates()` in `duplicates.py`: per-schema fingerprints from existing table data (normalised name tokens + canonical column names), pairwise Jaccard, cross-catalog only. New `GET /api/duplicates/schema-groups?threshold=0.7` route. `API.getSchemaGroups()` in `api.js`. New “Schemas” tab + `renderSchemaGroups()` — lazy-loads on first visit; shows table sim, column sim, table counts, shared tokens. |
 # MAGIC
 # MAGIC ---
 # MAGIC

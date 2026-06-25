@@ -52,6 +52,8 @@ const API = {
 
   getGroups() { return this.get('/duplicates/groups'); },
 
+  getSchemaGroups(threshold = 0.7) { return this.get('/duplicates/schema-groups' + this._qs({ threshold })); },
+
   compareTables(cat1, s1, t1, cat2, s2, t2) {
     return this.get(`/compare/${cat1}/${s1}/${t1}/${cat2}/${s2}/${t2}`);
   },
