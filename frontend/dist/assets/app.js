@@ -20,7 +20,20 @@ let state = {
     hidePipelineStages: true,
     hideSharedSource: false,
     catalogPrefix: '',
+    catalogPrefixMode: 'any',
+    minGroupSize: 2,
+    crossCatalogOnly: false,
+    showDismissed: false,
+    searchQuery: '',
+    minScore: 0,
+    maxScore: 100,
+    schemaPrefix: '',
+    schemaPrefixMode: 'any',
+    tableTypes: [],
+    ownerFilter: '',
   },
+  sortBy: 'score',
+  compactView: false,
   groupsPageSize: 50,
   groupsShown: 50,
   cacheLoading: true,   // true during initial cache check on startup
@@ -131,6 +144,32 @@ function loading(msg = 'Loading...') {
   return `<div class="loading"><div class="spinner"></div>${msg}</div>`;
 }
 
+// ===== Dismissed Groups (localStorage) =====
+function groupKey(g) {
+  return g.tables.slice().sort().join(',');
+}
+
+function getDismissedKeys() {
+  try { return new Set(JSON.parse(localStorage.getItem('uc-dismissed-groups') || '[]')); }
+  catch { return new Set(); }
+}
+
+function saveDismissedKeys(keys) {
+  localStorage.setItem('uc-dismissed-groups', JSON.stringify([...keys]));
+}
+
+function dismissGroup(g) {
+  const keys = getDismissedKeys();
+  keys.add(groupKey(g));
+  saveDismissedKeys(keys);
+}
+
+function undismissGroup(g) {
+  const keys = getDismissedKeys();
+  keys.delete(groupKey(g));
+  saveDismissedKeys(keys);
+}
+
 // ===== Group Filtering =====
 function applyGroupFilters(groups) {
   console.log('[FILTER] input groups:', groups.length,
@@ -157,9 +196,49 @@ function applyGroupFilters(groups) {
     if (state.filters.hideSharedSource && tags.includes('shared_source'))
       return false;
 
+    const dismissed = getDismissedKeys();
+    if (!state.filters.showDismissed && dismissed.has(groupKey(g)))
+      return false;
+
+    if (state.filters.minGroupSize > 2 && g.tables.length < state.filters.minGroupSize)
+      return false;
+
+    if (state.filters.crossCatalogOnly) {
+      const catalogs = new Set(g.tables.map(t => t.split('.')[0]));
+      if (catalogs.size < 2) return false;
+    }
+
+    if (state.filters.searchQuery) {
+      const q = state.filters.searchQuery.toLowerCase();
+      const matchesLabel = g.label.toLowerCase().includes(q);
+      const matchesTable = g.tables.some(t => t.toLowerCase().includes(q));
+      if (!matchesLabel && !matchesTable) return false;
+    }
+
+    const maxScore = g.pairs.length ? Math.max(...g.pairs.map(p => p.composite_score)) * 100 : 0;
+    if (maxScore < state.filters.minScore || maxScore > state.filters.maxScore)
+      return false;
+
+    if (state.filters.schemaPrefix) {
+      const prefix = state.filters.schemaPrefix.toLowerCase();
+      const method = state.filters.schemaPrefixMode === 'all' ? 'every' : 'some';
+      const hasMatch = g.tables[method](t => t.split('.')[1]?.toLowerCase().startsWith(prefix));
+      if (!hasMatch) return false;
+    }
+
+    if (state.filters.tableTypes.length && g.table_types?.length) {
+      const hasMatch = g.table_types.some(t => state.filters.tableTypes.includes(t));
+      if (!hasMatch) return false;
+    }
+
+    if (state.filters.ownerFilter && g.owners?.length) {
+      if (!g.owners.includes(state.filters.ownerFilter)) return false;
+    }
+
     if (state.filters.catalogPrefix) {
       const prefix = state.filters.catalogPrefix.toLowerCase();
-      const hasMatch = g.tables.some(t => t.split('.')[0].toLowerCase().startsWith(prefix));
+      const method = state.filters.catalogPrefixMode === 'all' ? 'every' : 'some';
+      const hasMatch = g.tables[method](t => t.split('.')[0].toLowerCase().startsWith(prefix));
       if (!hasMatch) return false;
     }
 
@@ -170,9 +249,17 @@ function applyGroupFilters(groups) {
   return result;
 }
 
+function sortGroups(groups) {
+  const sorted = [...groups];
+  if (state.sortBy === 'size')     sorted.sort((a, b) => b.tables.length - a.tables.length);
+  if (state.sortBy === 'catalogs') sorted.sort((a, b) => new Set(b.tables.map(t => t.split('.')[0])).size - new Set(a.tables.map(t => t.split('.')[0])).size);
+  if (state.sortBy === 'score')    sorted.sort((a, b) => Math.max(...b.pairs.map(p => p.composite_score)) - Math.max(...a.pairs.map(p => p.composite_score)));
+  return sorted;
+}
+
 function filteredGroupsInfo() {
   const all = state.groups;
-  const filtered = applyGroupFilters(all);
+  const filtered = sortGroups(applyGroupFilters(all));
   const hidden = all.length - filtered.length;
   return { filtered, total: all.length, hidden };
 }
@@ -539,6 +626,45 @@ function renderTableDetail(info) {
   `;
 }
 
+function renderFilterSummary() {
+  const f = state.filters;
+  const defaults = {
+    hideGovernanceViews: true, hidePipelineStages: true, hideSharedSource: false,
+    catalogPrefix: '', minGroupSize: 2, crossCatalogOnly: false,
+    showDismissed: false, searchQuery: '',
+  };
+
+  const chips = [];
+  if (!f.hideGovernanceViews)  chips.push({ label: 'Showing governance views', key: 'hideGovernanceViews', value: true });
+  if (!f.hidePipelineStages)   chips.push({ label: 'Showing pipeline stages',  key: 'hidePipelineStages',  value: true });
+  if (f.hideSharedSource)      chips.push({ label: 'Hiding shared-source',      key: 'hideSharedSource',    value: false });
+  if (f.crossCatalogOnly)      chips.push({ label: 'Cross-catalog only',        key: 'crossCatalogOnly',    value: false });
+  if (f.showDismissed)         chips.push({ label: 'Showing dismissed',         key: 'showDismissed',       value: false });
+  if (f.minGroupSize > 2)      chips.push({ label: `Min size: ${f.minGroupSize}`, key: 'minGroupSize',      value: 2 });
+  if (f.searchQuery)           chips.push({ label: `Search: "${f.searchQuery}"`,  key: 'searchQuery',       value: '' });
+  if (f.catalogPrefix)         chips.push({ label: `Prefix: ${f.catalogPrefix}`,  key: 'catalogPrefix',     value: '' });
+  if (f.minScore > 0)              chips.push({ label: `Min score: ${f.minScore}%`,     key: 'minScore',     value: 0 });
+  if (f.maxScore < 100)            chips.push({ label: `Max score: ${f.maxScore}%`,     key: 'maxScore',     value: 100 });
+  if (f.schemaPrefix)              chips.push({ label: `Schema: ${f.schemaPrefix}`,      key: 'schemaPrefix', value: '' });
+  if (f.tableTypes.length)         chips.push({ label: `Types: ${f.tableTypes.join(', ')}`, key: '_tableTypes', value: '' });
+  if (f.ownerFilter)               chips.push({ label: `Owner: ${f.ownerFilter}`,        key: 'ownerFilter',  value: '' });
+  if (state.sortBy !== 'score') chips.push({ label: `Sort: ${state.sortBy}`, key: '_sortBy', value: 'score' });
+
+  if (!chips.length) return '';
+
+  const chipHtml = chips.map(c => `
+    <span class="tag tag-accent" style="cursor:pointer;font-size:11px" data-filter-key="${c.key}" data-filter-value="${c.value}" title="Click to clear">
+      ${c.label} &times;
+    </span>`).join('');
+
+  return `
+    <div id="filter-summary" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:12px;padding:8px 12px;background:var(--bg-card);border-radius:6px;border:1px solid var(--border)">
+      <span style="font-size:11px;color:var(--text-muted);margin-right:4px">Active filters:</span>
+      ${chipHtml}
+      <button class="btn btn-outline btn-sm" id="clear-filters-btn" style="font-size:11px;padding:2px 8px;margin-left:4px">Clear all</button>
+    </div>`;
+}
+
 // ===== Duplicates =====
 async function renderDuplicates() {
   if (!state.scanned) {
@@ -562,7 +688,12 @@ async function renderDuplicates() {
       <button class="btn btn-outline btn-sm" id="redetect-btn">Re-detect</button>
     </div>
     <div class="card" style="margin-bottom:16px;padding:14px">
-      <div style="font-weight:600;font-size:13px;margin-bottom:10px">Filters</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <span style="font-weight:600;font-size:13px">Filters</span>
+        <button class="btn btn-outline btn-sm" id="compact-toggle" title="${state.compactView ? 'Switch to card view' : 'Switch to compact view'}">
+          ${state.compactView ? '&#9646;&#9646; Card view' : '&#8803; Compact view'}
+        </button>
+      </div>
       <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center">
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
           <input type="checkbox" id="filter-gov" ${state.filters.hideGovernanceViews ? 'checked' : ''} />
@@ -574,16 +705,78 @@ async function renderDuplicates() {
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
           <input type="checkbox" id="filter-pipeline" ${state.filters.hidePipelineStages ? 'checked' : ''} />
-          Hide medallion pipeline stages
+          Hide pipeline stages
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="filter-cross-catalog" ${state.filters.crossCatalogOnly ? 'checked' : ''} />
+          Cross-catalog only
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="filter-show-dismissed" ${state.filters.showDismissed ? 'checked' : ''} />
+          Show dismissed
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Min group size
+          <input type="number" id="filter-min-size" min="2" max="20" value="${state.filters.minGroupSize}" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:60px" />
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          <input type="text" id="filter-search" value="${state.filters.searchQuery}" placeholder="Search table or group name…" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:220px" />
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Sort by
+          <select id="sort-by" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+            <option value="score"    ${state.sortBy === 'score'    ? 'selected' : ''}>Max similarity</option>
+            <option value="size"     ${state.sortBy === 'size'     ? 'selected' : ''}>Group size</option>
+            <option value="catalogs" ${state.sortBy === 'catalogs' ? 'selected' : ''}>Catalog count</option>
+          </select>
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Score
+          <input type="number" id="filter-min-score" min="0" max="100" value="${state.filters.minScore}" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:55px" />
+          –
+          <input type="number" id="filter-max-score" min="0" max="100" value="${state.filters.maxScore}" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:55px" />
+          %
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Schema prefix
+          <select id="filter-schema-mode" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+            <option value="any" ${state.filters.schemaPrefixMode === 'any' ? 'selected' : ''}>Any</option>
+            <option value="all" ${state.filters.schemaPrefixMode === 'all' ? 'selected' : ''}>All</option>
+          </select>
+          <input type="text" id="filter-schema-prefix" value="${state.filters.schemaPrefix}" placeholder="e.g. analytics" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:140px" />
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Table type
+          ${['TABLE','VIEW','EXTERNAL'].map(t =>
+            `<label style="display:flex;align-items:center;gap:3px;font-size:13px;cursor:pointer;font-weight:normal">
+              <input type="checkbox" class="filter-type-cb" value="${t}" ${state.filters.tableTypes.includes(t) ? 'checked' : ''} />
+              ${t[0] + t.slice(1).toLowerCase()}
+            </label>`
+          ).join('')}
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Owner
+          <select id="filter-owner" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);max-width:200px">
+            <option value="">Any</option>
+            ${[...new Set(state.groups.flatMap(g => g.owners || []))].sort().map(o =>
+              `<option value="${o}" ${state.filters.ownerFilter === o ? 'selected' : ''}>${o}</option>`
+            ).join('')}
+          </select>
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px">
           Catalog prefix
-          <input type="text" id="filter-prefix" value="${state.filters.catalogPrefix}" placeholder="e.g. catalog_40_copper" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:220px" />
+          <select id="filter-prefix-mode" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+            <option value="any" ${state.filters.catalogPrefixMode === 'any' ? 'selected' : ''}>Any</option>
+            <option value="all" ${state.filters.catalogPrefixMode === 'all' ? 'selected' : ''}>All</option>
+          </select>
+          catalog begins with
+          <input type="text" id="filter-prefix" value="${state.filters.catalogPrefix}" placeholder="e.g. catalog_40_copper" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:180px" />
         </label>
       </div>
       ${hidden ? `<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Showing ${filtered.length} of ${total} groups (${hidden} filtered)</div>` : ''}
     </div>
-    <div id="dup-groups">${filtered.length ? filtered.slice(0, state.groupsShown).map(g => renderDupGroupCard(g)).join('') + (filtered.length > state.groupsShown ? `<div style="text-align:center;padding:16px"><button class="btn btn-outline" id="show-more-btn">Show more (${state.groupsShown} of ${filtered.length})</button></div>` : '') : '<div class="empty-state"><h3>No duplicates found</h3><p>Try adjusting the threshold or filters.</p></div>'}</div>
+    ${renderFilterSummary()}
+    <div id="dup-groups">${filtered.length ? (state.compactView ? renderCompactView(filtered) : filtered.slice(0, state.groupsShown).map(g => renderDupGroupCard(g)).join('') + (filtered.length > state.groupsShown ? `<div style="text-align:center;padding:16px"><button class="btn btn-outline" id="show-more-btn">Show more (${state.groupsShown} of ${filtered.length})</button></div>` : '')) : '<div class="empty-state"><h3>No duplicates found</h3><p>Try adjusting the threshold or filters.</p></div>'}</div>
   `;
 
   // ── Filter event handlers ──
@@ -592,6 +785,18 @@ async function renderDuplicates() {
     state.filters.hidePipelineStages = $('filter-pipeline').checked;
     state.filters.hideSharedSource = $('filter-shared-source').checked;
     state.filters.catalogPrefix = $('filter-prefix').value.trim();
+    state.filters.catalogPrefixMode = $('filter-prefix-mode').value;
+    state.filters.crossCatalogOnly = $('filter-cross-catalog').checked;
+    state.filters.showDismissed = $('filter-show-dismissed').checked;
+    state.filters.minGroupSize = parseInt($('filter-min-size').value) || 2;
+    state.filters.searchQuery  = $('filter-search').value.trim();
+    state.filters.minScore     = parseInt($('filter-min-score').value) || 0;
+    state.filters.maxScore     = parseInt($('filter-max-score').value) || 100;
+    state.filters.schemaPrefix = $('filter-schema-prefix').value.trim();
+    state.filters.schemaPrefixMode = $('filter-schema-mode').value;
+    state.filters.tableTypes   = [...document.querySelectorAll('.filter-type-cb:checked')].map(cb => cb.value);
+    state.filters.ownerFilter  = $('filter-owner').value;
+    state.sortBy = $('sort-by').value;
     state.groupsShown = state.groupsPageSize;  // reset pagination on filter change
     renderDuplicates();
   }
@@ -599,6 +804,81 @@ async function renderDuplicates() {
   $('filter-gov').onchange = onFilterChange;
   $('filter-pipeline').onchange = onFilterChange;
   $('filter-shared-source').onchange = onFilterChange;
+  $('filter-prefix-mode').onchange = onFilterChange;
+  $('filter-cross-catalog').onchange = onFilterChange;
+  $('filter-show-dismissed').onchange = onFilterChange;
+
+  // Filter summary chip clicks and clear-all
+  document.getElementById('filter-summary')?.addEventListener('click', e => {
+    const chip = e.target.closest('[data-filter-key]');
+    if (chip) {
+      const key = chip.dataset.filterKey;
+      const val = chip.dataset.filterValue;
+      if (key === '_sortBy')    { state.sortBy = val; }
+      else if (key === '_tableTypes') { state.filters.tableTypes = []; }
+      else {
+        const parsed = val === 'true' ? true : val === 'false' ? false : (isNaN(val) ? val : Number(val));
+        state.filters[key] = parsed;
+      }
+      state.groupsShown = state.groupsPageSize;
+      renderDuplicates();
+    }
+  });
+
+  const clearBtn = $('clear-filters-btn');
+  if (clearBtn) clearBtn.onclick = () => {
+    state.filters.hideGovernanceViews = true;
+    state.filters.hidePipelineStages  = true;
+    state.filters.hideSharedSource    = false;
+    state.filters.catalogPrefix       = '';
+    state.filters.minGroupSize        = 2;
+    state.filters.crossCatalogOnly    = false;
+    state.filters.showDismissed       = false;
+    state.filters.searchQuery         = '';
+    state.filters.minScore            = 0;
+    state.filters.maxScore            = 100;
+    state.filters.schemaPrefix        = '';
+    state.filters.schemaPrefixMode    = 'any';
+    state.filters.tableTypes          = [];
+    state.filters.ownerFilter         = '';
+    state.sortBy = 'score';
+    state.groupsShown = state.groupsPageSize;
+    renderDuplicates();
+  };
+
+  $('compact-toggle').onclick = () => {
+    state.compactView = !state.compactView;
+    renderDuplicates();
+  };
+
+  $('filter-schema-mode').onchange = onFilterChange;
+  $('filter-owner').onchange = onFilterChange;
+  document.querySelectorAll('.filter-type-cb').forEach(cb => cb.onchange = onFilterChange);
+
+  let _scoreTimer = null;
+  ['filter-min-score', 'filter-max-score'].forEach(id => {
+    $(id).oninput = () => { clearTimeout(_scoreTimer); _scoreTimer = setTimeout(onFilterChange, 400); };
+  });
+
+  let _schemaPrefixTimer = null;
+  $('filter-schema-prefix').oninput = () => {
+    clearTimeout(_schemaPrefixTimer);
+    _schemaPrefixTimer = setTimeout(onFilterChange, 400);
+  };
+
+  let _searchTimer = null;
+  $('filter-search').oninput = () => {
+    clearTimeout(_searchTimer);
+    _searchTimer = setTimeout(onFilterChange, 400);
+  };
+
+  $('sort-by').onchange = onFilterChange;
+
+  let _minSizeTimer = null;
+  $('filter-min-size').oninput = () => {
+    clearTimeout(_minSizeTimer);
+    _minSizeTimer = setTimeout(onFilterChange, 400);
+  };
 
   // "Show more" button — appends next page without full re-render
   const showMoreBtn = $('show-more-btn');
@@ -655,6 +935,45 @@ async function renderDuplicates() {
   };
 }
 
+function renderCompactView(groups) {
+  const rows = groups.map(g => {
+    const maxScore = g.pairs.length ? Math.max(...g.pairs.map(p => p.composite_score)) : 0;
+    const catalogs = [...new Set(g.tables.map(t => t.split('.')[0]))];
+    const tags = (g.tags || []).map(t => `<span class="tag tag-accent" style="font-size:10px">${t}</span>`).join(' ');
+    const goldShort = g.gold_standard ? g.gold_standard.split('.').pop() : '\u2014';
+    const firstPair = g.pairs[0];
+    const compareBtn = firstPair
+      ? `<button class="btn btn-outline btn-sm compare-btn" data-a="${firstPair.table_a}" data-b="${firstPair.table_b}">Compare</button>`
+      : '';
+    return `<tr>
+      <td style="font-weight:600;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${g.label}">${g.label}</td>
+      <td style="text-align:center">${g.tables.length}</td>
+      <td><span class="similarity-score" style="color:${similarityColor(maxScore)}">${(maxScore * 100).toFixed(0)}%</span></td>
+      <td style="text-align:center">${catalogs.length}</td>
+      <td style="font-size:11px;color:var(--text-muted);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${g.gold_standard || ''}">${goldShort}</td>
+      <td>${tags}</td>
+      <td style="white-space:nowrap">${compareBtn}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Group</th>
+          <th>Tables</th>
+          <th>Score</th>
+          <th>Catalogs</th>
+          <th>Gold standard</th>
+          <th>Tags</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
 function renderDupGroupCard(g) {
   const maxScore = g.pairs.length ? Math.max(...g.pairs.map(p => p.composite_score)) : 0;
   const catalogSet = new Set(g.tables.map(t => t.split('.')[0]));
@@ -664,7 +983,10 @@ function renderDupGroupCard(g) {
     <div class="dup-group">
       <div class="dup-group-header">
         <span class="dup-group-title">${g.label} \u2014 ${g.tables.length} tables${crossCatalog ? ` across ${catalogSet.size} catalogs` : ''}</span>
-        <span class="similarity-score" style="color:${similarityColor(maxScore)}">${(maxScore * 100).toFixed(0)}% max similarity</span>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="similarity-score" style="color:${similarityColor(maxScore)}">${(maxScore * 100).toFixed(0)}% max similarity</span>
+          <button class="btn btn-outline btn-sm dismiss-btn" data-key="${groupKey(g)}" style="font-size:11px;padding:2px 8px;opacity:0.6" title="Dismiss this group">Dismiss</button>
+        </div>
       </div>
       <div class="similarity-bar"><div class="similarity-bar-fill" style="width:${maxScore * 100}%;background:${similarityColor(maxScore)}"></div></div>
       <div class="dup-tables-list" style="margin-top:10px">
@@ -675,8 +997,29 @@ function renderDupGroupCard(g) {
         }).join('')}
       </div>
       ${g.gold_standard ? `<div style="margin-top:8px"><span class="gold-badge">\u2605 Gold Standard: ${g.gold_standard}</span></div>` : ''}
-      <div style="margin-top:12px">
-        <table class="data-table">
+      ${(function() {
+        const li = g.lineage_info;
+        if (!li || !li.deepest_common_ancestor) return '';
+        const ancShort = li.deepest_common_ancestor.split('.').slice(1).join('.');
+        const depthVals = Object.values(li.pipeline_depths || {}).filter(v => v != null);
+        const depthRange = depthVals.length
+          ? (Math.min(...depthVals) === Math.max(...depthVals)
+              ? `${Math.min(...depthVals)} hop${Math.min(...depthVals) !== 1 ? 's' : ''}`
+              : `${Math.min(...depthVals)}–${Math.max(...depthVals)} hops`)
+          : '';
+        const covPct = Math.round((li.lineage_coverage || 0) * 100);
+        const covColor = covPct >= 80 ? 'var(--green)' : covPct >= 50 ? 'var(--yellow)' : 'var(--text-muted)';
+        return `<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px;color:var(--text-muted)">
+          <span title="Closest ancestor shared by all tables in this group">&#128279; Common source: <strong style="color:var(--text)">${ancShort}</strong>${depthRange ? ` &mdash; ${depthRange}` : ''}</span>
+          <span title="Fraction of tables with lineage data" style="color:${covColor}">&#9681; ${covPct}% lineage coverage</span>
+        </div>`;
+      })()}
+
+      <details style="margin-top:12px">
+        <summary style="cursor:pointer;font-size:12px;color:var(--text-muted);user-select:none;padding:4px 0">
+          Show ${g.pairs.length} pair${g.pairs.length !== 1 ? 's' : ''}
+        </summary>
+        <table class="data-table" style="margin-top:8px">
           <thead><tr><th>Table A</th><th>Table B</th><th>Columns</th><th>Types</th><th>Name</th><th>Lineage</th><th>Score</th><th></th></tr></thead>
           <tbody>
             ${g.pairs.slice(0, 6).map(p => {
@@ -693,12 +1036,22 @@ function renderDupGroupCard(g) {
             }).join('')}
           </tbody>
         </table>
-      </div>
+      </details>
     </div>
   `;
 }
 
 document.addEventListener('click', (e) => {
+  const dismissBtn = e.target.closest('.dismiss-btn');
+  if (dismissBtn) {
+    const key = dismissBtn.dataset.key;
+    const keys = getDismissedKeys();
+    keys.add(key);
+    saveDismissedKeys(keys);
+    renderDuplicates();
+    return;
+  }
+
   const btn = e.target.closest('.compare-btn');
   if (btn) {
     const [c1, s1, t1] = btn.dataset.a.split('.');

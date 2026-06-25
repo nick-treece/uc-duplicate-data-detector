@@ -245,6 +245,9 @@ class DuplicateGroup:
     gold_standard: str | None = None
     gold_scores: dict = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
+    table_types: list[str] = field(default_factory=list)  # e.g. ['TABLE', 'VIEW']
+    owners: list[str] = field(default_factory=list)       # distinct owners across all tables
+    lineage_info: dict = field(default_factory=dict)      # deepest_common_ancestor, pipeline_depths, lineage_coverage
 
     def to_dict(self):
         return {
@@ -255,6 +258,9 @@ class DuplicateGroup:
             "gold_standard": self.gold_standard,
             "gold_scores": self.gold_scores,
             "tags": self.tags,
+            "table_types": self.table_types,
+            "owners": self.owners,
+            "lineage_info": self.lineage_info,
         }
 
 
@@ -526,6 +532,52 @@ def _apply_tags(
     _tag_shared_source(groups, upstream_map=upstream_map)
 
 
+def _compute_group_lineage_info(
+    group: "DuplicateGroup",
+    transitive_upstream: dict[str, dict[str, int]],
+) -> dict:
+    """Compute lineage summary for a duplicate group.
+
+    Returns a dict with:
+      - lineage_coverage: fraction of tables that have transitive upstream data
+      - deepest_common_ancestor: full name of the closest ancestor shared by all tables
+      - pipeline_depths: {table_full_name: hop_count_to_common_ancestor}
+    """
+    tables = group.tables
+    if not transitive_upstream or not tables:
+        return {}
+
+    # Coverage: how many tables have any lineage data at all
+    tables_with_lineage = sum(1 for t in tables if t.lower() in transitive_upstream)
+    coverage = round(tables_with_lineage / len(tables), 2)
+
+    # Common ancestors: intersection of each table's transitive upstream
+    ancestor_sets = [frozenset(transitive_upstream.get(t.lower(), {}).keys()) for t in tables]
+    common = ancestor_sets[0]
+    for s in ancestor_sets[1:]:
+        common = common & s
+
+    if not common:
+        return {"lineage_coverage": coverage}
+
+    # Closest common ancestor = minimise total depth across all tables
+    def total_depth(anc: str) -> int:
+        return sum(transitive_upstream.get(t.lower(), {}).get(anc, 999) for t in tables)
+
+    closest = min(common, key=total_depth)
+
+    pipeline_depths = {
+        t: transitive_upstream.get(t.lower(), {}).get(closest)
+        for t in tables
+    }
+
+    return {
+        "lineage_coverage": coverage,
+        "deepest_common_ancestor": closest,
+        "pipeline_depths": pipeline_depths,
+    }
+
+
 def detect_duplicates(
     tables: list[TableInfo],
     threshold: float = 0.5,
@@ -664,7 +716,7 @@ def detect_duplicates(
     if progress_fn:
         progress_fn(f"Clustering {len(pairs):,} pairs into groups…", 0, 0)
 
-    groups = _cluster_pairs(pairs)
+    groups = _cluster_pairs(pairs, progress_fn=progress_fn)
 
     # ── Phase 5: Score gold standard ─────────────────────────────────
     if progress_fn:
@@ -677,6 +729,13 @@ def detect_duplicates(
         group.gold_scores = scores
         if scores:
             group.gold_standard = max(scores, key=scores.get)
+
+    # ── Phase 5b: Enrich groups with table_types and owners ──────────
+    for group in groups:
+        infos = [table_map[n] for n in group.tables if n in table_map]
+        group.table_types = sorted({t.table_type.upper() for t in infos})
+        group.owners = sorted({t.owner for t in infos if t.owner})
+        group.lineage_info = _compute_group_lineage_info(group, transitive_upstream)
 
     # ── Phase 6: Tag groups for filtering ────────────────────────────
     if progress_fn:
@@ -707,8 +766,16 @@ def _derive_group_label(full_names: list[str]) -> str:
     return re.sub(r"[_\-]+", " ", shortest).title()
 
 
-def _cluster_pairs(pairs: list[DuplicatePair]) -> list[DuplicateGroup]:
-    """Union-find clustering of table pairs into groups."""
+def _cluster_pairs(
+    pairs: list[DuplicatePair],
+    progress_fn: Callable[[str, int, int], None] | None = None,
+) -> list[DuplicateGroup]:
+    """Union-find clustering of table pairs into groups.
+
+    Uses a pair index for O(n) group reconstruction instead of scanning
+    all pairs for every group (previously O(groups × pairs)).
+    """
+    # ── Step 1: Union-find to assign every table to a root ──
     parent: dict[str, str] = {}
 
     def find(x):
@@ -727,20 +794,31 @@ def _cluster_pairs(pairs: list[DuplicatePair]) -> list[DuplicateGroup]:
         parent.setdefault(p.table_b, p.table_b)
         union(p.table_a, p.table_b)
 
+    # ── Step 2: Group table names by their root ──
     clusters: dict[str, list[str]] = {}
     for node in parent:
-        root = find(node)
-        clusters.setdefault(root, []).append(node)
+        clusters.setdefault(find(node), []).append(node)
 
+    # ── Step 3: Build a pair index keyed by root — O(n) total ──
+    # Previously this was O(groups × pairs): each group scanned all pairs.
+    pair_index: dict[str, list[DuplicatePair]] = {}
+    for p in pairs:
+        root = find(p.table_a)
+        pair_index.setdefault(root, []).append(p)
+
+    # ── Step 4: Build DuplicateGroup objects ──
+    total = len(clusters)
     groups = []
-    for i, (_, members) in enumerate(sorted(clusters.items())):
-        group_pairs = [p for p in pairs if p.table_a in members or p.table_b in members]
+    for i, (root, members) in enumerate(sorted(clusters.items())):
+        if progress_fn and i % 500 == 0:
+            progress_fn(f"Clustering groups…", i, total)
+            time.sleep(0)  # yield GIL for HTTP threads
         sorted_members = sorted(members)
         groups.append(DuplicateGroup(
             group_id=i + 1,
             label=_derive_group_label(sorted_members),
             tables=sorted_members,
-            pairs=group_pairs,
+            pairs=pair_index.get(root, []),
         ))
 
     return groups
