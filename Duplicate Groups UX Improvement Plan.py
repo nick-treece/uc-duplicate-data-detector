@@ -192,7 +192,7 @@
 # MAGIC | 10 | **Schema prefix filter** | None | Mirror the catalog prefix control but match `t.split('.')[1]` (the schema segment). Can share the same Any/All mode toggle. |
 # MAGIC | 11 | **Table type filter** | Group object needs `table_types` field | Add `table_types: list[str]` to the serialised group dict in `duplicates.py` (derived from `TableInfo.table_type`). Frontend: a multi-select toggle for TABLE / VIEW / EXTERNAL. |
 # MAGIC | 12 | **Owner filter** | Group object needs `owners` field | Add `owners: list[str]` to the group dict. Frontend: a dropdown populated dynamically from the distinct owners across all groups in `state.groups`. |
-# MAGIC | 13 | **Lineage depth badge on group cards** | Enhancement 4 in Lineage Plan (not yet started) | _Deferred — depends on Enhancement 4 in the Lineage Plan which has not yet been implemented._ |
+# MAGIC | 13 | **Lineage depth badge on group cards** | Lineage Enhancement Plan ✅ | Implemented as part of Lineage Enhancement 5. Group cards now show: closest common ancestor (`schema.table`), hop range (e.g. “2–3 hops”), and lineage coverage %. Displayed on all cards with lineage data — not restricted to tagged groups, as the data is useful regardless of tag. Populated via `_compute_group_lineage_info()` in `duplicates.py` Phase 5b; serialised into cached group dicts as `lineage_info`. |
 # MAGIC
 # MAGIC ---
 # MAGIC
