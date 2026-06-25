@@ -182,7 +182,7 @@
 # MAGIC
 # MAGIC ---
 # MAGIC
-# MAGIC ### Sprint 3 — Medium-Effort Filtering and Display
+# MAGIC ### Sprint 3 — ✅ Completed
 # MAGIC
 # MAGIC These require either additional data on the group object, a backend change, or a more involved frontend component.
 # MAGIC
@@ -192,7 +192,7 @@
 # MAGIC | 10 | **Schema prefix filter** | None | Mirror the catalog prefix control but match `t.split('.')[1]` (the schema segment). Can share the same Any/All mode toggle. |
 # MAGIC | 11 | **Table type filter** | Group object needs `table_types` field | Add `table_types: list[str]` to the serialised group dict in `duplicates.py` (derived from `TableInfo.table_type`). Frontend: a multi-select toggle for TABLE / VIEW / EXTERNAL. |
 # MAGIC | 12 | **Owner filter** | Group object needs `owners` field | Add `owners: list[str]` to the group dict. Frontend: a dropdown populated dynamically from the distinct owners across all groups in `state.groups`. |
-# MAGIC | 13 | **Lineage depth badge on group cards** | Enhancement 4 in Lineage Plan (not yet started) | Surface the deepest common ancestor and hop count on cards tagged `pipeline_stage` or `shared_source`. Requires `shared_ancestors` data to be included in the cached group dict — currently only returned by the compare endpoint on demand. |
+# MAGIC | 13 | **Lineage depth badge on group cards** | Enhancement 4 in Lineage Plan (not yet started) | _Deferred — depends on Enhancement 4 in the Lineage Plan which has not yet been implemented._ |
 # MAGIC
 # MAGIC ---
 # MAGIC

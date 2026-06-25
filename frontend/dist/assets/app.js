@@ -25,6 +25,12 @@ let state = {
     crossCatalogOnly: false,
     showDismissed: false,
     searchQuery: '',
+    minScore: 0,
+    maxScore: 100,
+    schemaPrefix: '',
+    schemaPrefixMode: 'any',
+    tableTypes: [],
+    ownerFilter: '',
   },
   sortBy: 'score',
   compactView: false,
@@ -207,6 +213,26 @@ function applyGroupFilters(groups) {
       const matchesLabel = g.label.toLowerCase().includes(q);
       const matchesTable = g.tables.some(t => t.toLowerCase().includes(q));
       if (!matchesLabel && !matchesTable) return false;
+    }
+
+    const maxScore = g.pairs.length ? Math.max(...g.pairs.map(p => p.composite_score)) * 100 : 0;
+    if (maxScore < state.filters.minScore || maxScore > state.filters.maxScore)
+      return false;
+
+    if (state.filters.schemaPrefix) {
+      const prefix = state.filters.schemaPrefix.toLowerCase();
+      const method = state.filters.schemaPrefixMode === 'all' ? 'every' : 'some';
+      const hasMatch = g.tables[method](t => t.split('.')[1]?.toLowerCase().startsWith(prefix));
+      if (!hasMatch) return false;
+    }
+
+    if (state.filters.tableTypes.length && g.table_types?.length) {
+      const hasMatch = g.table_types.some(t => state.filters.tableTypes.includes(t));
+      if (!hasMatch) return false;
+    }
+
+    if (state.filters.ownerFilter && g.owners?.length) {
+      if (!g.owners.includes(state.filters.ownerFilter)) return false;
     }
 
     if (state.filters.catalogPrefix) {
@@ -617,6 +643,11 @@ function renderFilterSummary() {
   if (f.minGroupSize > 2)      chips.push({ label: `Min size: ${f.minGroupSize}`, key: 'minGroupSize',      value: 2 });
   if (f.searchQuery)           chips.push({ label: `Search: "${f.searchQuery}"`,  key: 'searchQuery',       value: '' });
   if (f.catalogPrefix)         chips.push({ label: `Prefix: ${f.catalogPrefix}`,  key: 'catalogPrefix',     value: '' });
+  if (f.minScore > 0)              chips.push({ label: `Min score: ${f.minScore}%`,     key: 'minScore',     value: 0 });
+  if (f.maxScore < 100)            chips.push({ label: `Max score: ${f.maxScore}%`,     key: 'maxScore',     value: 100 });
+  if (f.schemaPrefix)              chips.push({ label: `Schema: ${f.schemaPrefix}`,      key: 'schemaPrefix', value: '' });
+  if (f.tableTypes.length)         chips.push({ label: `Types: ${f.tableTypes.join(', ')}`, key: '_tableTypes', value: '' });
+  if (f.ownerFilter)               chips.push({ label: `Owner: ${f.ownerFilter}`,        key: 'ownerFilter',  value: '' });
   if (state.sortBy !== 'score') chips.push({ label: `Sort: ${state.sortBy}`, key: '_sortBy', value: 'score' });
 
   if (!chips.length) return '';
@@ -700,6 +731,39 @@ async function renderDuplicates() {
           </select>
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Score
+          <input type="number" id="filter-min-score" min="0" max="100" value="${state.filters.minScore}" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:55px" />
+          –
+          <input type="number" id="filter-max-score" min="0" max="100" value="${state.filters.maxScore}" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:55px" />
+          %
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Schema prefix
+          <select id="filter-schema-mode" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+            <option value="any" ${state.filters.schemaPrefixMode === 'any' ? 'selected' : ''}>Any</option>
+            <option value="all" ${state.filters.schemaPrefixMode === 'all' ? 'selected' : ''}>All</option>
+          </select>
+          <input type="text" id="filter-schema-prefix" value="${state.filters.schemaPrefix}" placeholder="e.g. analytics" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:140px" />
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Table type
+          ${['TABLE','VIEW','EXTERNAL'].map(t =>
+            `<label style="display:flex;align-items:center;gap:3px;font-size:13px;cursor:pointer;font-weight:normal">
+              <input type="checkbox" class="filter-type-cb" value="${t}" ${state.filters.tableTypes.includes(t) ? 'checked' : ''} />
+              ${t[0] + t.slice(1).toLowerCase()}
+            </label>`
+          ).join('')}
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+          Owner
+          <select id="filter-owner" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);max-width:200px">
+            <option value="">Any</option>
+            ${[...new Set(state.groups.flatMap(g => g.owners || []))].sort().map(o =>
+              `<option value="${o}" ${state.filters.ownerFilter === o ? 'selected' : ''}>${o}</option>`
+            ).join('')}
+          </select>
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px">
           Catalog prefix
           <select id="filter-prefix-mode" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
             <option value="any" ${state.filters.catalogPrefixMode === 'any' ? 'selected' : ''}>Any</option>
@@ -725,7 +789,13 @@ async function renderDuplicates() {
     state.filters.crossCatalogOnly = $('filter-cross-catalog').checked;
     state.filters.showDismissed = $('filter-show-dismissed').checked;
     state.filters.minGroupSize = parseInt($('filter-min-size').value) || 2;
-    state.filters.searchQuery = $('filter-search').value.trim();
+    state.filters.searchQuery  = $('filter-search').value.trim();
+    state.filters.minScore     = parseInt($('filter-min-score').value) || 0;
+    state.filters.maxScore     = parseInt($('filter-max-score').value) || 100;
+    state.filters.schemaPrefix = $('filter-schema-prefix').value.trim();
+    state.filters.schemaPrefixMode = $('filter-schema-mode').value;
+    state.filters.tableTypes   = [...document.querySelectorAll('.filter-type-cb:checked')].map(cb => cb.value);
+    state.filters.ownerFilter  = $('filter-owner').value;
     state.sortBy = $('sort-by').value;
     state.groupsShown = state.groupsPageSize;  // reset pagination on filter change
     renderDuplicates();
@@ -744,7 +814,8 @@ async function renderDuplicates() {
     if (chip) {
       const key = chip.dataset.filterKey;
       const val = chip.dataset.filterValue;
-      if (key === '_sortBy') { state.sortBy = val; }
+      if (key === '_sortBy')    { state.sortBy = val; }
+      else if (key === '_tableTypes') { state.filters.tableTypes = []; }
       else {
         const parsed = val === 'true' ? true : val === 'false' ? false : (isNaN(val) ? val : Number(val));
         state.filters[key] = parsed;
@@ -764,6 +835,12 @@ async function renderDuplicates() {
     state.filters.crossCatalogOnly    = false;
     state.filters.showDismissed       = false;
     state.filters.searchQuery         = '';
+    state.filters.minScore            = 0;
+    state.filters.maxScore            = 100;
+    state.filters.schemaPrefix        = '';
+    state.filters.schemaPrefixMode    = 'any';
+    state.filters.tableTypes          = [];
+    state.filters.ownerFilter         = '';
     state.sortBy = 'score';
     state.groupsShown = state.groupsPageSize;
     renderDuplicates();
@@ -772,6 +849,21 @@ async function renderDuplicates() {
   $('compact-toggle').onclick = () => {
     state.compactView = !state.compactView;
     renderDuplicates();
+  };
+
+  $('filter-schema-mode').onchange = onFilterChange;
+  $('filter-owner').onchange = onFilterChange;
+  document.querySelectorAll('.filter-type-cb').forEach(cb => cb.onchange = onFilterChange);
+
+  let _scoreTimer = null;
+  ['filter-min-score', 'filter-max-score'].forEach(id => {
+    $(id).oninput = () => { clearTimeout(_scoreTimer); _scoreTimer = setTimeout(onFilterChange, 400); };
+  });
+
+  let _schemaPrefixTimer = null;
+  $('filter-schema-prefix').oninput = () => {
+    clearTimeout(_schemaPrefixTimer);
+    _schemaPrefixTimer = setTimeout(onFilterChange, 400);
   };
 
   let _searchTimer = null;
