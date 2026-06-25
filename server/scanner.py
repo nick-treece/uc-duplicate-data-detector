@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import urllib.request
 from collections import defaultdict, deque
@@ -124,7 +125,6 @@ class CatalogScanner:
         self._consumer_counts: dict[str, int] = {}
         self._column_lineage_map: dict[tuple[str, str], list[tuple[str, str]]] = {}
         self._transitive_upstream: dict[str, dict[str, int]] = {}  # table → {ancestor: min_depth}
-        self._transitive_upstream: dict[str, dict[str, int]] = {}
 
         # Background scan state
         self._scan_lock = threading.Lock()
@@ -394,21 +394,32 @@ class CatalogScanner:
         )
 
         per_catalog = {}
-        for cat_info in catalogs:
+        results_lock = threading.Lock()
+
+        def _scan_catalog(cat_info):
             name = cat_info["name"]
-            self._update_status(current_catalog=name, message=f"Scanning {name}\u2026")
             try:
-                stats = self._scan_one(name)
-                per_catalog[name] = stats
-                self._scanned_catalogs.append(name)
+                stats, local_tables, local_schemas = self._scan_one(name)
+                with results_lock:
+                    self._tables.extend(local_tables)
+                    self._schemas.extend(local_schemas)
+                    self._scanned_catalogs.append(name)
+                return name, stats, None
             except Exception as e:
                 logger.warning(f"Failed to scan catalog {name}: {e}")
-                per_catalog[name] = {"error": str(e), "schema_count": 0,
-                                     "table_count": 0, "column_count": 0}
                 self._add_error(f"Catalog {name}: {e}")
-            with self._scan_lock:
-                self._scan_status["catalogs_done"] += 1
-                self._scan_status["catalogs_scanned"] = list(self._scanned_catalogs)
+                return name, {"error": str(e), "schema_count": 0,
+                              "table_count": 0, "column_count": 0}, e
+
+        self._update_status(message=f"Scanning {len(catalogs)} catalogs in parallel\u2026")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(_scan_catalog, cat): cat for cat in catalogs}
+            for future in as_completed(futures):
+                name, stats, _ = future.result()
+                per_catalog[name] = stats
+                with self._scan_lock:
+                    self._scan_status["catalogs_done"] += 1
+                    self._scan_status["catalogs_scanned"] = list(self._scanned_catalogs)
 
         self._scanned = True
         with self._scan_lock:
@@ -489,15 +500,14 @@ class CatalogScanner:
             s.table_count = schema_table_counts.get(s.name, 0)
 
         self._fetch_permissions(catalog, local_tables)
-        self._tables.extend(local_tables)
-        self._schemas.extend(local_schemas)
 
-        return {
+        stats = {
             "catalog": catalog,
             "schema_count": len(local_schemas),
             "table_count": len(local_tables),
             "column_count": sum(len(t.columns) for t in local_tables),
         }
+        return stats, local_tables, local_schemas
 
     # \u2500\u2500 Permissions fetching \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 
@@ -725,43 +735,35 @@ class CatalogScanner:
         logger.info(f"Bulk-loaded {len(self._tables)} tables")
 
     def bulk_load_columns(self):
+        """Load all columns in a single query instead of one per catalog."""
         src = self._METADATA_SOURCE
-        catalogs: dict[str, list[TableInfo]] = defaultdict(list)
-        for t in self._tables:
-            catalogs[t.catalog].append(t)
-
-        total_cats = len(catalogs)
+        skip = self._skip_catalogs_sql()
+        self._update_status(message="Loading columns\u2026")
+        col_rows = self._run_sql(
+            f"SELECT table_catalog, table_schema, table_name, column_name, "
+            f"       full_data_type, ordinal_position, is_nullable, comment "
+            f"FROM {src}.columns "
+            f"WHERE table_schema != 'information_schema' "
+            f"  AND table_catalog NOT IN ({skip}) "
+            f"ORDER BY table_catalog, table_schema, table_name, ordinal_position",
+            quiet=True,
+        )
+        if not col_rows:
+            return
+        col_lookup: dict[tuple, list[ColumnInfo]] = defaultdict(list)
+        for row in col_rows:
+            col_lookup[(row[0], row[1], row[2])].append(ColumnInfo(
+                name=row[3], type_name=row[4] or "unknown",
+                position=int(row[5]) if row[5] else 0,
+                nullable=row[6] != "NO", comment=row[7],
+            ))
         total_cols = 0
-        for i, (catalog, cat_tables) in enumerate(sorted(catalogs.items())):
-            if i % 10 == 0:
-                self._update_status(message=f"Loading columns\u2026 {i}/{total_cats} catalogs")
-                time.sleep(0)
-
-            col_rows = self._run_sql(
-                f"SELECT table_schema, table_name, column_name, "
-                f"       full_data_type, ordinal_position, is_nullable, comment "
-                f"FROM {src}.columns "
-                f"WHERE table_catalog = '{catalog}' "
-                f"  AND table_schema != 'information_schema' "
-                f"ORDER BY table_schema, table_name, ordinal_position",
-                quiet=True,
-            )
-            if not col_rows:
-                continue
-            col_lookup: dict[tuple, list[ColumnInfo]] = defaultdict(list)
-            for row in col_rows:
-                col_lookup[(row[0], row[1])].append(ColumnInfo(
-                    name=row[2], type_name=row[3] or "unknown",
-                    position=int(row[4]) if row[4] else 0,
-                    nullable=row[5] != "NO", comment=row[6],
-                ))
-            for table in cat_tables:
-                key = (table.schema, table.name)
-                if key in col_lookup:
-                    table.columns = col_lookup[key]
-                    total_cols += len(col_lookup[key])
-
-        logger.info(f"bulk_load_columns: {total_cols} columns loaded across {total_cats} catalogs")
+        for table in self._tables:
+            key = (table.catalog, table.schema, table.name)
+            if key in col_lookup:
+                table.columns = col_lookup[key]
+                total_cols += len(col_lookup[key])
+        logger.info(f"bulk_load_columns: {total_cols} columns loaded in 1 query")
 
     def bulk_load_schemas(self):
         src = self._METADATA_SOURCE
@@ -796,42 +798,39 @@ class CatalogScanner:
         src = self._METADATA_SOURCE
         self._update_status(message="Loading table lineage\u2026")
 
-        edge_rows = self._run_sql(
-            f"SELECT DISTINCT source_table_full_name, target_table_full_name, entity_type "
-            f"FROM {src}.table_lineage "
-            f"WHERE event_date >= DATEADD(DAY, -90, CURRENT_DATE()) "
-            f"  AND source_table_full_name IS NOT NULL "
-            f"  AND target_table_full_name IS NOT NULL",
+        # Single pass over table_lineage: edges + consumer counts via UNION ALL
+        combined_rows = self._run_sql(
+            f"WITH period AS ("
+            f"  SELECT source_table_full_name, target_table_full_name, entity_type, entity_id"
+            f"  FROM {src}.table_lineage"
+            f"  WHERE event_date >= DATEADD(DAY, -90, CURRENT_DATE())"
+            f"    AND source_table_full_name IS NOT NULL"
+            f"    AND target_table_full_name IS NOT NULL"
+            f") "
+            f"SELECT 'edge' AS rt, source_table_full_name AS s, target_table_full_name AS t,"
+            f"       entity_type AS et, CAST(NULL AS BIGINT) AS cnt"
+            f"  FROM (SELECT DISTINCT source_table_full_name, target_table_full_name, entity_type FROM period) e"
+            f" UNION ALL"
+            f"SELECT 'count' AS rt, source_table_full_name AS s, CAST(NULL AS STRING) AS t,"
+            f"       CAST(NULL AS STRING) AS et, COUNT(DISTINCT entity_id) AS cnt"
+            f"  FROM period WHERE entity_id IS NOT NULL"
+            f" GROUP BY source_table_full_name",
             quiet=True,
         )
         raw_edges: dict[tuple[str, str], set[str]] = defaultdict(set)
-        if edge_rows:
-            for row in edge_rows:
-                source = row[0].lower()
-                target = row[1].lower()
-                entity_type = row[2] or "UNKNOWN"
-                raw_edges[(source, target)].add(entity_type)
+        self._consumer_counts = {}
+        if combined_rows:
+            for row in combined_rows:
+                if row[0] == "edge":
+                    raw_edges[(row[1].lower(), row[2].lower())].add(row[3] or "UNKNOWN")
+                else:
+                    self._consumer_counts[row[1].lower()] = int(row[4])
 
         self._lineage_edges = [
             LineageEdge(source_table=s, target_table=t, entity_types=e)
             for (s, t), e in raw_edges.items()
         ]
         self._build_lineage_lookups()
-        self._build_transitive_upstream()
-
-        consumer_rows = self._run_sql(
-            f"SELECT source_table_full_name, COUNT(DISTINCT entity_id) AS consumer_count "
-            f"FROM {src}.table_lineage "
-            f"WHERE event_date >= DATEADD(DAY, -90, CURRENT_DATE()) "
-            f"  AND source_table_full_name IS NOT NULL "
-            f"  AND entity_id IS NOT NULL "
-            f"GROUP BY source_table_full_name",
-            quiet=True,
-        )
-        self._consumer_counts = {}
-        if consumer_rows:
-            for row in consumer_rows:
-                self._consumer_counts[row[0].lower()] = int(row[1])
 
         # Build transitive ancestor map (depth-capped BFS)
         self._build_transitive_upstream()
@@ -848,64 +847,6 @@ class CatalogScanner:
         for edge in self._lineage_edges:
             self._upstream_map[edge.target_table].add(edge.source_table)
             self._downstream_map[edge.source_table].add(edge.target_table)
-
-    def _build_transitive_upstream(
-        self, max_depth: int = 5, max_ancestors: int = 500,
-    ):
-        """Compute transitive ancestors for every table via depth-capped BFS.
-
-        Walks ``_upstream_map`` edges up to *max_depth* hops, storing the
-        shortest path depth to each ancestor.  Tables with fan-in above
-        the norm (hub tables) are capped at *max_ancestors* to prevent
-        memory/time blow-up.
-
-        Result is stored in ``_transitive_upstream``:
-            {table: {ancestor: min_depth, ...}}
-        """
-        self._update_status(message="Building transitive ancestry\u2026")
-        upstream = self._upstream_map
-        result: dict[str, dict[str, int]] = {}
-
-        for table in upstream:
-            ancestors: dict[str, int] = {}
-            visited: set[str] = {table}
-            queue: deque[tuple[str, int]] = deque()
-
-            # Seed with direct parents (depth 1)
-            for parent in upstream.get(table, ()):
-                if parent not in visited:
-                    queue.append((parent, 1))
-                    visited.add(parent)
-
-            while queue:
-                node, depth = queue.popleft()
-
-                # Record this ancestor at the shortest depth seen
-                if node not in ancestors or depth < ancestors[node]:
-                    ancestors[node] = depth
-
-                # Stop expanding if we've hit the caps
-                if len(ancestors) >= max_ancestors:
-                    break
-                if depth >= max_depth:
-                    continue
-
-                # Expand to grandparents
-                for grandparent in upstream.get(node, ()):
-                    if grandparent not in visited:
-                        visited.add(grandparent)
-                        queue.append((grandparent, depth + 1))
-
-            if ancestors:
-                result[table] = ancestors
-
-        self._transitive_upstream = result
-        logger.info(
-            f"Transitive upstream: {len(result)} tables, "
-            f"avg {sum(len(v) for v in result.values()) / max(len(result), 1):.1f} "
-            f"ancestors/table"
-        )
-
 
     def _build_transitive_upstream(self, max_depth: int = 3, max_ancestors: int = 200):
         """Compute transitive ancestors for every table via depth-capped BFS.
