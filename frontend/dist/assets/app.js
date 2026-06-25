@@ -20,6 +20,7 @@ let state = {
     hidePipelineStages: true,
     hideSharedSource: false,
     catalogPrefix: '',
+    catalogPrefixMode: 'any',
   },
   groupsPageSize: 50,
   groupsShown: 50,
@@ -159,7 +160,8 @@ function applyGroupFilters(groups) {
 
     if (state.filters.catalogPrefix) {
       const prefix = state.filters.catalogPrefix.toLowerCase();
-      const hasMatch = g.tables.some(t => t.split('.')[0].toLowerCase().startsWith(prefix));
+      const method = state.filters.catalogPrefixMode === 'all' ? 'every' : 'some';
+      const hasMatch = g.tables[method](t => t.split('.')[0].toLowerCase().startsWith(prefix));
       if (!hasMatch) return false;
     }
 
@@ -578,7 +580,12 @@ async function renderDuplicates() {
         </label>
         <label style="display:flex;align-items:center;gap:6px;font-size:13px">
           Catalog prefix
-          <input type="text" id="filter-prefix" value="${state.filters.catalogPrefix}" placeholder="e.g. catalog_40_copper" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:220px" />
+          <select id="filter-prefix-mode" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+            <option value="any" ${state.filters.catalogPrefixMode === 'any' ? 'selected' : ''}>Any</option>
+            <option value="all" ${state.filters.catalogPrefixMode === 'all' ? 'selected' : ''}>All</option>
+          </select>
+          catalog begins with
+          <input type="text" id="filter-prefix" value="${state.filters.catalogPrefix}" placeholder="e.g. catalog_40_copper" style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:180px" />
         </label>
       </div>
       ${hidden ? `<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Showing ${filtered.length} of ${total} groups (${hidden} filtered)</div>` : ''}
@@ -592,6 +599,7 @@ async function renderDuplicates() {
     state.filters.hidePipelineStages = $('filter-pipeline').checked;
     state.filters.hideSharedSource = $('filter-shared-source').checked;
     state.filters.catalogPrefix = $('filter-prefix').value.trim();
+    state.filters.catalogPrefixMode = $('filter-prefix-mode').value;
     state.groupsShown = state.groupsPageSize;  // reset pagination on filter change
     renderDuplicates();
   }
@@ -599,6 +607,7 @@ async function renderDuplicates() {
   $('filter-gov').onchange = onFilterChange;
   $('filter-pipeline').onchange = onFilterChange;
   $('filter-shared-source').onchange = onFilterChange;
+  $('filter-prefix-mode').onchange = onFilterChange;
 
   // "Show more" button — appends next page without full re-render
   const showMoreBtn = $('show-more-btn');
