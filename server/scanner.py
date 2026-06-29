@@ -117,6 +117,7 @@ class CatalogScanner:
         self._scanned = False
         self._scanned_catalogs: list[str] = []
         self._duplicate_groups: list[dict] = []
+        self._schema_groups: list[dict] = []
 
         # Lineage data
         self._lineage_edges: list[LineageEdge] = []
@@ -230,6 +231,11 @@ class CatalogScanner:
 
                 groups = detect_duplicates(self._tables, lineage=lineage_ctx, progress_fn=_detection_progress)
                 self._duplicate_groups = [g.to_dict() for g in groups]
+
+                # Schema-level duplicate detection
+                self._update_status(message="Detecting schema duplicates\u2026")
+                from server.duplicates import detect_schema_duplicates
+                self._schema_groups = detect_schema_duplicates(self._tables, threshold=0.7)
                 result["groups_count"] = len(self._duplicate_groups)
                 logger.info(f"Detected {len(self._duplicate_groups)} duplicate groups")
             except Exception as e:
@@ -243,7 +249,7 @@ class CatalogScanner:
             try:
                 from server.cache import CacheManager
                 cache_mgr = CacheManager(self)
-                cache_mgr.write_cache(result, self._duplicate_groups)
+                cache_mgr.write_cache(result, self._duplicate_groups, self._schema_groups)
             except Exception as e:
                 logger.warning(f"Cache write failed (non-fatal): {e}")
                 self._add_error(f"Cache write: {e}")
@@ -636,6 +642,12 @@ class CatalogScanner:
 
     def set_duplicate_groups(self, groups: list[dict]):
         self._duplicate_groups = groups
+
+    def get_schema_groups(self) -> list[dict]:
+        return self._schema_groups
+
+    def set_schema_groups(self, groups: list[dict]):
+        self._schema_groups = groups
 
     def get_all_tables_raw(self) -> list[TableInfo]:
         return self._tables

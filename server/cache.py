@@ -61,6 +61,10 @@ _TABLE_DDLS = {
         gold_scores_json STRING,
         tags_json        STRING
     """,
+    "schema_groups": """
+        scan_id     INT,
+        result_json STRING
+    """,
 }
 
 _COL_PATTERN = re.compile(r"(\w+)\s+(?:INT|STRING|TIMESTAMP)\b")
@@ -221,7 +225,7 @@ class CacheManager:
 
     # ── Write cache ───────────────────────────────────────────────────────
 
-    def write_cache(self, scan_result: dict, groups: list[dict]):
+    def write_cache(self, scan_result: dict, groups: list[dict], schema_groups: list[dict] | None = None):
         """Persist scan results and duplicate groups to the cache tables.
 
         Each call appends a new ``scan_id`` — previous scans are retained
@@ -247,9 +251,14 @@ class CacheManager:
         if groups:
             self._write_groups_batched(scan_id, groups)
 
+        # ── Schema groups ─────────────────────────────────────────────
+        if schema_groups:
+            self._write_schema_groups_batched(scan_id, schema_groups)
+
         logger.info(
             f"Cache written \u2014 scan_id={scan_id}, "
-            f"{len(groups)} duplicate group(s)"
+            f"{len(groups)} duplicate group(s), "
+            f"{len(schema_groups or [])} schema group(s)"
         )
 
     # SQL Statement API has a ~1MB payload limit; stay well under it.
@@ -304,6 +313,41 @@ class CacheManager:
         sql = prefix + ", ".join(rows)
         logger.debug(f"Cache INSERT: {len(rows)} rows, {len(sql):,} bytes")
         self._run_sql(sql)
+
+    def _serialise_schema_row(self, scan_id: int, g: dict) -> str:
+        result = self._esc(json.dumps(g, default=str))
+        return f"({scan_id}, '{result}')"
+
+    def _write_schema_groups_batched(self, scan_id: int, schema_groups: list[dict]):
+        insert_prefix = f"INSERT INTO {CACHE_SCHEMA}.schema_groups VALUES "
+        prefix_len = len(insert_prefix)
+        value_rows: list[str] = []
+        current_len = prefix_len
+        for g in schema_groups:
+            row = self._serialise_schema_row(scan_id, g)
+            row_len = len(row) + 2
+            if value_rows and (current_len + row_len) > self._MAX_SQL_BYTES:
+                self._flush_group_rows(insert_prefix, value_rows)
+                value_rows = []
+                current_len = prefix_len
+            value_rows.append(row)
+            current_len += row_len
+        if value_rows:
+            self._flush_group_rows(insert_prefix, value_rows)
+
+    def load_schema_groups(self) -> list[dict]:
+        """Load schema duplicate pairs from the latest scan."""
+        latest = self._latest_scan_id()
+        if latest is None:
+            return []
+        rows = self._run_sql(
+            f"SELECT result_json FROM {CACHE_SCHEMA}.schema_groups "
+            f"WHERE scan_id = {latest}",
+            quiet=True,
+        )
+        if not rows:
+            return []
+        return [json.loads(row[0]) for row in rows if row[0]]
 
     # ── Read cache ────────────────────────────────────────────────────────
 
