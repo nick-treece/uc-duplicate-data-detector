@@ -895,7 +895,11 @@ def detect_schema_duplicates(
         token_sets = [table_tokens[s] for s in schemas if table_tokens.get(s)]
         shared = frozenset.intersection(*token_sets) if len(token_sets) > 1 else (token_sets[0] if token_sets else frozenset())
 
+        label_tokens = sorted(shared)[:3]
+        label = " · ".join(label_tokens) if label_tokens else schemas[0].split(".")[-1]
+
         groups.append({
+            "label": label,
             "schemas": schemas,
             "table_counts": {s: len(schema_tables[s]) for s in schemas},
             "max_table_similarity": round(max(t_sims), 3),

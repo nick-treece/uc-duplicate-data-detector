@@ -11,6 +11,22 @@ const API = {
     return resp.json();
   },
 
+  async postJson(path, body) {
+    const resp = await fetch(`/api${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error(`API error: ${resp.status}`);
+    return resp.json();
+  },
+
+  async delete(path) {
+    const resp = await fetch(`/api${path}`, { method: 'DELETE' });
+    if (!resp.ok) throw new Error(`API error: ${resp.status}`);
+    return resp.json();
+  },
+
   _qs(params) {
     const p = Object.entries(params).filter(([, v]) => v != null && v !== '');
     return p.length ? '?' + p.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&') : '';
@@ -53,6 +69,14 @@ const API = {
   getGroups() { return this.get('/duplicates/groups'); },
 
   getSchemaGroups(threshold = 0.7) { return this.get('/duplicates/schema-groups' + this._qs({ threshold })); },
+
+  getDismissed() { return this.get('/duplicates/dismissed'); },
+  dismissGroup(groupKey, groupType, rationale) {
+    return this.postJson('/duplicates/dismiss', { group_key: groupKey, group_type: groupType, rationale });
+  },
+  undismissGroup(groupKey) {
+    return this.delete(`/duplicates/dismiss/${encodeURIComponent(groupKey)}`);
+  },
 
   compareTables(cat1, s1, t1, cat2, s2, t2) {
     return this.get(`/compare/${cat1}/${s1}/${t1}/${cat2}/${s2}/${t2}`);

@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 CACHE_SCHEMA = "catalog_40_copper_uc_metadata.cache"
 CACHE_MAX_AGE_DAYS = 7
 
+# Separate table for user dismissals — not part of the cache fingerprint
+_DISMISSED_TABLE = f"{CACHE_SCHEMA}.dismissed_groups"
+
 # Cache table DDL — single source of truth for both ensure_schema()
 # and the fingerprint.  Column names are derived automatically.
 _TABLE_DDLS = {
@@ -365,6 +368,55 @@ class CacheManager:
         if not rows or not rows[0][0]:
             return None
         return json.loads(rows[0][0])
+
+
+    # ── Dismissed groups ──────────────────────────────────────────────────
+
+    def ensure_dismissed_table(self):
+        """Create the dismissed_groups table if it does not exist."""
+        self._run_sql(
+            f"CREATE TABLE IF NOT EXISTS {_DISMISSED_TABLE} "
+            f"(group_key STRING, group_type STRING, rationale STRING, dismissed_at TIMESTAMP)"
+        )
+
+    def save_dismissed_group(self, group_key: str, group_type: str, rationale: str):
+        """Upsert a dismissed group record (delete then insert for idempotency)."""
+        self.ensure_dismissed_table()
+        key_e   = self._esc(group_key)
+        type_e  = self._esc(group_type)
+        rat_e   = self._esc(rationale)
+        self._run_sql(f"DELETE FROM {_DISMISSED_TABLE} WHERE group_key = '{key_e}'")
+        self._run_sql(
+            f"INSERT INTO {_DISMISSED_TABLE} VALUES "
+            f"('{key_e}', '{type_e}', '{rat_e}', current_timestamp())"
+        )
+
+    def delete_dismissed_group(self, group_key: str):
+        """Remove a dismissal record (undismiss)."""
+        key_e = self._esc(group_key)
+        self._run_sql(f"DELETE FROM {_DISMISSED_TABLE} WHERE group_key = '{key_e}'")
+
+    def load_dismissed_groups(self) -> list[dict]:
+        """Return all dismissed group records."""
+        try:
+            rows = self._run_sql(
+                f"SELECT group_key, group_type, rationale, dismissed_at "
+                f"FROM {_DISMISSED_TABLE}",
+                quiet=True,
+            )
+        except Exception:
+            return []
+        if not rows:
+            return []
+        return [
+            {
+                "group_key":   row[0] or "",
+                "group_type":  row[1] or "",
+                "rationale":   row[2] or "",
+                "dismissed_at": str(row[3]) if row[3] else "",
+            }
+            for row in rows if row[0]
+        ]
 
     def load_groups(self) -> list[dict]:
         """Load duplicate groups from the latest scan."""
