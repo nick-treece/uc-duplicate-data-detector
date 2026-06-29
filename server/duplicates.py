@@ -789,26 +789,26 @@ def detect_schema_duplicates(
     threshold: float = 0.7,
     max_schemas: int = 5000,
 ) -> list[dict]:
-    """Find pairs of schemas with similar table structure across different catalogs.
+    """Find groups of schemas with similar table structure across different catalogs.
 
-    Uses the same name-token normalisation as table-level detection.
-    Compares schemas pairwise: Jaccard similarity on normalised table name tokens,
-    plus a secondary column-name overlap score.
+    Uses the same union-find clustering as table-level duplicate detection.
+    Schemas are compared pairwise (Jaccard on table name tokens + column overlap),
+    then connected components form groups — so all four copies of a schema
+    appear in one group rather than as separate pairs.
 
-    Only cross-catalog pairs are returned.
+    Only cross-catalog pairs contribute edges; same-catalog schemas are never merged.
     """
     from collections import defaultdict
 
-    # Group tables by schema (catalog.schema)
+    # Group tables by full schema key (catalog.schema)
     schema_tables: dict[str, list[TableInfo]] = defaultdict(list)
     for t in tables:
         schema_tables[f"{t.catalog}.{t.schema}"].append(t)
 
-    # Guard: skip if too many schemas to compare pairwise
     if len(schema_tables) > max_schemas:
         schema_tables = dict(list(schema_tables.items())[:max_schemas])
 
-    # Build fingerprints: normalised table name tokens + canonical column names
+    # Build per-schema fingerprints
     schema_list = sorted(schema_tables.keys())
     table_tokens: dict[str, frozenset] = {}
     col_tokens: dict[str, frozenset] = {}
@@ -817,12 +817,11 @@ def detect_schema_duplicates(
             tok for t in tbls for tok in _tokenize_name(t.name)
         )
         col_tokens[schema] = frozenset(
-            _canonical_col(c.name)
-            for t in tbls for c in t.columns
+            _canonical_col(c.name) for t in tbls for c in t.columns
         )
 
-    # Pairwise comparison (cross-catalog only)
-    results = []
+    # ── Step 1: Pairwise similarity (cross-catalog only) ──────────────────────
+    pairs: list[dict] = []
     for i, a in enumerate(schema_list):
         cat_a = a.split(".")[0]
         fa = table_tokens[a]
@@ -831,7 +830,7 @@ def detect_schema_duplicates(
         for b in schema_list[i + 1:]:
             cat_b = b.split(".")[0]
             if cat_a == cat_b:
-                continue  # only cross-catalog
+                continue
 
             fb = table_tokens[b]
             if not fb:
@@ -847,20 +846,68 @@ def detect_schema_duplicates(
             col_union = ca | cb
             col_sim = len(ca & cb) / len(col_union) if col_union else 0.0
 
-            results.append({
+            pairs.append({
                 "schema_a": a,
                 "schema_b": b,
                 "table_similarity": round(table_sim, 3),
                 "column_similarity": round(col_sim, 3),
-                "table_count_a": len(schema_tables[a]),
-                "table_count_b": len(schema_tables[b]),
-                "shared_tokens": sorted(inter)[:20],
                 "only_a": sorted(fa - fb)[:10],
                 "only_b": sorted(fb - fa)[:10],
             })
 
-    results.sort(key=lambda x: x["table_similarity"], reverse=True)
-    return results
+    # ── Step 2: Union-find clustering ─────────────────────────────────────────
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: str, y: str) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+    for p in pairs:
+        union(p["schema_a"], p["schema_b"])
+
+    # ── Step 3: Group schemas by connected component ──────────────────────────
+    clusters: dict[str, set[str]] = defaultdict(set)
+    for schema in parent:
+        clusters[find(schema)].add(schema)
+
+    # ── Step 4: Build group dicts ─────────────────────────────────────────────
+    schema_set_index: dict[str, str] = {s: find(s) for s in parent}
+    groups: list[dict] = []
+
+    for root, members in clusters.items():
+        schemas = sorted(members)
+        group_pairs = [
+            p for p in pairs
+            if schema_set_index.get(p["schema_a"]) == root
+        ]
+
+        t_sims = [p["table_similarity"] for p in group_pairs]
+        c_sims = [p["column_similarity"] for p in group_pairs]
+
+        # Tokens shared across ALL schemas in the group
+        token_sets = [table_tokens[s] for s in schemas if table_tokens.get(s)]
+        shared = frozenset.intersection(*token_sets) if len(token_sets) > 1 else (token_sets[0] if token_sets else frozenset())
+
+        groups.append({
+            "schemas": schemas,
+            "table_counts": {s: len(schema_tables[s]) for s in schemas},
+            "max_table_similarity": round(max(t_sims), 3),
+            "avg_table_similarity": round(sum(t_sims) / len(t_sims), 3),
+            "max_column_similarity": round(max(c_sims), 3),
+            "avg_column_similarity": round(sum(c_sims) / len(c_sims), 3),
+            "shared_tokens": sorted(shared)[:20],
+            "pairs": sorted(group_pairs, key=lambda x: x["table_similarity"], reverse=True),
+        })
+
+    groups.sort(key=lambda x: (len(x["schemas"]), x["max_table_similarity"]), reverse=True)
+    return groups
 
 def _cluster_pairs(
     pairs: list[DuplicatePair],

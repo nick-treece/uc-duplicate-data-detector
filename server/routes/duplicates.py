@@ -40,14 +40,14 @@ def get_groups():
 
 @router.get("/schema-groups")
 def schema_groups(threshold: float = Query(0.7, ge=0.1, le=1.0)):
-    """Return pre-computed schema duplicate pairs (cached at scan time).
+    """Return pre-computed schema duplicate groups (cached at scan time).
 
     Results are computed at threshold=0.7 during the scan and cached.
-    The threshold parameter filters the cached results in-memory;
-    values below 0.7 return all cached pairs (no rescan needed).
+    The threshold parameter filters the cached results in-memory by
+    max_table_similarity; values below 0.7 return all cached groups.
     """
     if not scanner.is_scanned:
         return JSONResponse(status_code=400, content={"error": "No scan has been run yet"})
     all_groups = scanner.get_schema_groups()
-    filtered = [g for g in all_groups if g.get("table_similarity", 0) >= threshold]
+    filtered = [g for g in all_groups if g.get("max_table_similarity", 0) >= threshold]
     return {"groups": filtered, "total": len(filtered), "threshold": threshold}

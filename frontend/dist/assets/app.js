@@ -14,7 +14,8 @@ let state = {
   selectedTable: null,
   compareResult: null,
   threshold: 0.5,
-  cacheInfo: null,   // { cached_at, age_days } when loaded from cache
+  cacheInfo: null,
+  cacheInvalidReason: null,   // { cached_at, age_days } when loaded from cache
   filters: {
     hideGovernanceViews: true,
     hidePipelineStages: true,
@@ -35,10 +36,11 @@ let state = {
   },
   sortBy: 'score',
   compactView: false,
-  duplicatesTab: 'groups',
+  duplicatesTab: 'schemas',
   schemaGroups: null,   // null = not loaded, [] = loaded
   schemasCompact: false,
   schemasThreshold: 0.7,
+  schemasFilters: { search: '', minTableSim: 0, maxTableSim: 100, catalogPrefix: '', catalogPrefixMode: 'any', minTables: 0 },
   groupsPageSize: 50,
   groupsShown: 50,
   cacheLoading: true,   // true during initial cache check on startup
@@ -74,9 +76,10 @@ async function tryLoadFromCache() {
 
     const status = await API.cacheStatus();
     if (!status.valid) {
-      console.log('Cache not valid:', status.reason);
+      state.cacheInvalidReason = status.reason;
       return;
     }
+    state.cacheInvalidReason = null;
 
     state.scanProgress = { message: 'Cache found \u2014 loading scan results\u2026' };
     renderDashboard();
@@ -296,6 +299,10 @@ async function renderDashboard() {
   main().innerHTML = `
     <h2 class="page-title">Dashboard</h2>
     <p class="page-desc">Scan all accessible Unity Catalog metadata, detect duplicate datasets, and identify gold-standard tables.</p>
+    ${state.cacheInvalidReason && !state.cacheLoading && !state.scanned ? `<div class="card" style="margin-bottom:16px;padding:12px;display:flex;align-items:center;gap:8px;border-left:3px solid var(--yellow, #f59e0b)">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--yellow, #f59e0b)" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span style="font-size:13px;color:var(--text-muted)"><strong style="color:var(--text)">Cache is out of date</strong> \u2014 ${state.cacheInvalidReason}. A fresh scan is needed to reload duplicate groups.</span>
+    </div>` : ''}
     ${state.cacheInfo ? `<div class="card" style="margin-bottom:16px;padding:12px;display:flex;align-items:center;gap:8px;border-left:3px solid var(--green)">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
       <span style="font-size:13px;color:var(--text-muted)">Loaded from cache \u2014 <strong>${Math.floor(state.cacheInfo.age_days)}d ago</strong>.
@@ -771,16 +778,78 @@ function renderOwnerSummary() {
 
 function buildDupTabNav() {
   return `<div style="display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0">
-    ${['groups','heatmap','owners','schemas','info'].map(t => `
+    ${['schemas','groups','heatmap','owners','info'].map(t => `
       <button onclick="state.duplicatesTab='${t}';renderDuplicates()" style="padding:7px 16px;font-size:13px;font-weight:${state.duplicatesTab===t?'600':'400'};border:none;background:none;cursor:pointer;color:${state.duplicatesTab===t?'var(--accent)':'var(--text-muted)'};border-bottom:2px solid ${state.duplicatesTab===t?'var(--accent)':'transparent'};margin-bottom:-1px">
-        ${{groups:'Groups',heatmap:'Heatmap',owners:'Owners',schemas:'Schemas',info:'Info'}[t]}
+        ${{schemas:'Schemas',groups:'Objects',heatmap:'Heatmap',owners:'Owners',info:'Info'}[t]}
       </button>`).join('')}
   </div>`;
 }
 
+function applySchemaFilters(groups) {
+  const f = state.schemasFilters;
+  return groups.filter(g => {
+    // Table similarity range — compare against highest pairwise sim in group
+    const tSim = Math.round(g.max_table_similarity * 100);
+    if (tSim < f.minTableSim || tSim > f.maxTableSim) return false;
+
+    // Catalog prefix — any/all across all catalogs in the group
+    if (f.catalogPrefix) {
+      const prefix = f.catalogPrefix.toLowerCase();
+      const catalogs = g.schemas.map(s => s.split('.')[0].toLowerCase());
+      const matches = catalogs.filter(c => c.includes(prefix)).length;
+      if (f.catalogPrefixMode === 'all' ? matches < catalogs.length : matches === 0)
+        return false;
+    }
+
+    // Minimum table count — at least one schema in the group must meet it
+    if (f.minTables > 0) {
+      const counts = Object.values(g.table_counts || {});
+      if (!counts.some(c => c >= f.minTables)) return false;
+    }
+
+    // Free-text search against any schema full name in the group
+    if (f.search) {
+      const q = f.search.toLowerCase();
+      if (!g.schemas.some(s => s.toLowerCase().includes(q))) return false;
+    }
+
+    return true;
+  });
+}
+
+function schemaFilterSummary(filtered, total) {
+  const f = state.schemasFilters;
+  const chips = [];
+  if (f.search)          chips.push({ label: `Search: "${f.search}"`,              key: 'search',     val: '' });
+  if (f.minTableSim > 0) chips.push({ label: `Max table sim ≥ ${f.minTableSim}%`,   key: 'minTableSim', val: 0 });
+  if (f.maxTableSim < 100) chips.push({ label: `Max table sim ≤ ${f.maxTableSim}%`, key: 'maxTableSim', val: 100 });
+  if (f.catalogPrefix)   chips.push({ label: `Catalog (${f.catalogPrefixMode}): "${f.catalogPrefix}"`, key: 'catalogPrefix', val: '' });
+  if (f.minTables > 0)   chips.push({ label: `Min tables: ${f.minTables}`,          key: 'minTables',  val: 0 });
+
+  if (!chips.length) return '';
+
+  const chipHtml = chips.map(c =>
+    `<span class="filter-chip" data-schema-filter-key="${c.key}" data-schema-filter-val="${c.val}"
+      style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:11px;background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);cursor:pointer">
+      ${c.label} &times;
+    </span>`
+  ).join('');
+
+  const hidden = total - filtered;
+  return `
+    <div id="schema-filter-summary" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 0;margin-bottom:4px">
+      ${chipHtml}
+      <button id="clear-schema-filters" class="btn btn-outline btn-sm" style="font-size:11px;padding:2px 8px">
+        Clear all
+      </button>
+      ${hidden > 0 ? `<span style="font-size:12px;color:var(--text-muted);margin-left:4px">${hidden} pair${hidden!==1?'s':''} hidden</span>` : ''}
+    </div>`;
+}
+
 async function renderSchemaGroups() {
-  const tabNav  = buildDupTabNav();
+  const tabNav    = buildDupTabNav();
   const threshold = state.schemasThreshold;
+  let _schemaSearchTimer, _schemaSimTimer, _schemaCatTimer, _schemaMinTablesTimer;
 
   // Loading state on first visit (or after refresh)
   if (state.schemaGroups === null) {
@@ -802,57 +871,156 @@ async function renderSchemaGroups() {
     return;
   }
 
-  const groups = state.schemaGroups;
+  const allGroups      = state.schemaGroups;
+  const filtered       = applySchemaFilters(allGroups);
+  const f              = state.schemasFilters;
 
-  // ── Toolbar ──────────────────────────────────────────────────────────────
-  const toolbar = `
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
-      <span style="font-size:13px;color:var(--text-muted)">
-        <strong>${groups.length}</strong> schema pair${groups.length !== 1 ? 's' : ''}
-        with &ge;${(threshold * 100).toFixed(0)}% table-name overlap
-      </span>
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-muted)">
-        Threshold
-        <input type="number" id="schema-threshold" min="0.1" max="1" step="0.05"
-          value="${threshold}"
-          style="width:60px;padding:3px 6px;font-size:13px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text)"
-          title="Lower = more pairs; press Enter to reload" />
-      </label>
-      <button class="btn btn-outline btn-sm" onclick="state.schemaGroups=null;renderDuplicates()">Refresh</button>
-      <button class="btn btn-outline btn-sm" id="schema-compact-toggle"
-        style="${state.schemasCompact ? 'background:var(--accent-soft);border-color:var(--accent)' : ''}">
-        ${state.schemasCompact ? 'Card view' : 'Compact view'}
-      </button>
+  // ── Filter card ───────────────────────────────────────────────────────────
+  const filterCard = `
+    <div class="card" style="padding:14px 16px;margin-bottom:16px">
+      <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">
+
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label style="font-size:11px;color:var(--text-muted)">Search schemas</label>
+          <input type="text" id="sf-search" value="${f.search}"
+            placeholder="Schema or catalog name…"
+            style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:200px" />
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label style="font-size:11px;color:var(--text-muted)">Catalog contains</label>
+          <div style="display:flex;align-items:center;gap:4px">
+            <select id="sf-catalog-mode" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+              <option value="any" ${f.catalogPrefixMode === 'any' ? 'selected' : ''}>Any</option>
+              <option value="all" ${f.catalogPrefixMode === 'all' ? 'selected' : ''}>All</option>
+            </select>
+            <input type="text" id="sf-catalog" value="${f.catalogPrefix}"
+              placeholder="e.g. gold"
+              style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:110px" />
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label style="font-size:11px;color:var(--text-muted)">Table sim %</label>
+          <div style="display:flex;align-items:center;gap:4px">
+            <input type="number" id="sf-min-sim" min="0" max="100" value="${f.minTableSim}"
+              style="width:52px;font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)" />
+            <span style="font-size:12px;color:var(--text-muted)">–</span>
+            <input type="number" id="sf-max-sim" min="0" max="100" value="${f.maxTableSim}"
+              style="width:52px;font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)" />
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label style="font-size:11px;color:var(--text-muted)">Min tables</label>
+          <input type="number" id="sf-min-tables" min="0" value="${f.minTables}"
+            style="width:60px;font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)" />
+        </div>
+
+        <div style="display:flex;align-items:flex-end;gap:8px;margin-left:auto">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-muted)">
+            Threshold
+            <input type="number" id="schema-threshold" min="0.1" max="1" step="0.05"
+              value="${threshold}"
+              style="width:60px;padding:4px 6px;font-size:13px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text)"
+              title="Re-fetches from server at new threshold" />
+          </label>
+          <button class="btn btn-outline btn-sm" onclick="state.schemaGroups=null;renderDuplicates()">Refresh</button>
+          <button class="btn btn-outline btn-sm" id="schema-compact-toggle"
+            style="${state.schemasCompact ? 'background:var(--accent-soft);border-color:var(--accent)' : ''}">
+            ${state.schemasCompact ? 'Card view' : 'Compact view'}
+          </button>
+        </div>
+
+      </div>
+      ${schemaFilterSummary(filtered.length, allGroups.length)}
+    </div>`;
+
+  // ── Results count ─────────────────────────────────────────────────────────
+  const countLine = `
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">
+      Showing <strong>${filtered.length}</strong> of <strong>${allGroups.length}</strong>
+      schema group${allGroups.length !== 1 ? 's' : ''} with
+      &ge;${(threshold * 100).toFixed(0)}% table-name overlap
     </div>`;
 
   // ── Render ────────────────────────────────────────────────────────────────
   main().innerHTML = `
     <h2 class="page-title">Duplicate Detection</h2>
     ${tabNav}
-    ${toolbar}
+    ${filterCard}
+    ${countLine}
     <div id="schema-groups-list">
-      ${groups.length
-        ? (state.schemasCompact ? renderSchemaCompact(groups) : groups.map(renderSchemaCard).join(''))
-        : '<div class="empty-state"><h3>No schema duplicates found</h3><p>Try lowering the threshold.</p></div>'
+      ${filtered.length
+        ? (state.schemasCompact ? renderSchemaCompact(filtered) : filtered.map(renderSchemaCard).join(''))
+        : '<div class="empty-state"><h3>No schema groups match the current filters</h3><p>Try clearing some filters or lowering the threshold.</p></div>'
       }
     </div>`;
 
   // ── Event handlers ────────────────────────────────────────────────────────
-  const compactBtn = document.getElementById('schema-compact-toggle');
-  if (compactBtn) compactBtn.onclick = () => {
+  function onSchemaFilterChange() {
+    state.schemasFilters.search       = document.getElementById('sf-search')?.value.trim() || '';
+    state.schemasFilters.catalogPrefix     = document.getElementById('sf-catalog')?.value.trim() || '';
+    state.schemasFilters.catalogPrefixMode = document.getElementById('sf-catalog-mode')?.value || 'any';
+    state.schemasFilters.minTableSim  = parseInt(document.getElementById('sf-min-sim')?.value) || 0;
+    state.schemasFilters.maxTableSim  = parseInt(document.getElementById('sf-max-sim')?.value) || 100;
+    state.schemasFilters.minTables    = parseInt(document.getElementById('sf-min-tables')?.value) || 0;
+    renderSchemaGroups();
+  }
+
+  // Debounced text inputs
+  document.getElementById('sf-search')?.addEventListener('input', () => {
+    clearTimeout(_schemaSearchTimer);
+    _schemaSearchTimer = setTimeout(onSchemaFilterChange, 400);
+  });
+  document.getElementById('sf-catalog-mode')?.addEventListener('change', onSchemaFilterChange);
+  document.getElementById('sf-catalog')?.addEventListener('input', () => {
+    clearTimeout(_schemaCatTimer);
+    _schemaCatTimer = setTimeout(onSchemaFilterChange, 400);
+  });
+  ['sf-min-sim','sf-max-sim'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', () => {
+      clearTimeout(_schemaSimTimer);
+      _schemaSimTimer = setTimeout(onSchemaFilterChange, 400);
+    });
+  });
+  document.getElementById('sf-min-tables')?.addEventListener('input', () => {
+    clearTimeout(_schemaMinTablesTimer);
+    _schemaMinTablesTimer = setTimeout(onSchemaFilterChange, 400);
+  });
+
+  // Chip click — reset individual filter to default
+  document.getElementById('schema-filter-summary')?.addEventListener('click', e => {
+    const chip = e.target.closest('[data-schema-filter-key]');
+    if (!chip) return;
+    const key = chip.dataset.schemaFilterKey;
+    const val = chip.dataset.schemaFilterVal;
+    state.schemasFilters[key] = isNaN(Number(val)) ? val : Number(val);
+    if (key === 'catalogPrefix') state.schemasFilters.catalogPrefixMode = 'any';
+    renderSchemaGroups();
+  });
+
+  // Clear all filters
+  document.getElementById('clear-schema-filters')?.addEventListener('click', () => {
+    state.schemasFilters = { search: '', minTableSim: 0, maxTableSim: 100, catalogPrefix: '', catalogPrefixMode: 'any', minTables: 0 };
+    renderSchemaGroups();
+  });
+
+  // Compact toggle
+  document.getElementById('schema-compact-toggle')?.addEventListener('click', () => {
     state.schemasCompact = !state.schemasCompact;
     renderSchemaGroups();
-  };
+  });
 
-  const threshInput = document.getElementById('schema-threshold');
-  if (threshInput) threshInput.onchange = () => {
-    const v = parseFloat(threshInput.value);
+  // Threshold reload
+  document.getElementById('schema-threshold')?.addEventListener('change', () => {
+    const v = parseFloat(document.getElementById('schema-threshold').value);
     if (!isNaN(v) && v >= 0.1 && v <= 1.0) {
       state.schemasThreshold = v;
       state.schemaGroups = null;
       renderDuplicates();
     }
-  };
+  });
 }
 
 
@@ -865,113 +1033,131 @@ function _catalogBadge(fullSchema) {
 }
 
 
+function drillToGroups(schemaName) {
+  // Pre-filter the Groups tab to show duplicates involving tables from this schema
+  state.filters.schemaPrefix     = schemaName;
+  state.filters.schemaPrefixMode = 'any';
+  state.duplicatesTab            = 'groups';
+  renderDuplicates();
+}
+
 function renderSchemaCard(g) {
-  const catA    = g.schema_a.split('.')[0];
-  const nameA   = g.schema_a.split('.').slice(1).join('.');
-  const catB    = g.schema_b.split('.')[0];
-  const nameB   = g.schema_b.split('.').slice(1).join('.');
-  const sameCat = catA === catB;
+  const maxSim   = (g.max_table_similarity * 100).toFixed(0);
+  const avgSim   = (g.avg_table_similarity * 100).toFixed(0);
+  const maxColSim = (g.max_column_similarity * 100).toFixed(0);
+  const simColor = similarityColor(g.max_table_similarity);
 
-  const tableSim  = (g.table_similarity  * 100).toFixed(0);
-  const colSim    = (g.column_similarity * 100).toFixed(0);
-  const tSimColor = similarityColor(g.table_similarity);
-  const cSimColor = similarityColor(g.column_similarity);
+  const schemaChips = g.schemas.map(s => {
+    const cat  = s.split('.')[0];
+    const name = s.split('.').slice(1).join('.');
+    return `<span class="dup-table-tag" style="display:inline-flex;align-items:center;gap:5px;margin:2px">
+      ${_catalogBadge(s)}
+      <span style="font-size:12px">${name}</span>
+    </span>`;
+  }).join('');
 
-  const sharedChips = g.shared_tokens.map(t =>
+  const sharedChips = (g.shared_tokens || []).map(t =>
     `<span class="tag tag-accent" style="font-size:11px">${t}</span>`
   ).join(' ');
 
-  const onlyAChips = (g.only_a || []).map(t =>
-    `<span class="tag" style="font-size:11px;background:var(--accent-soft)">${t}</span>`
-  ).join(' ');
-  const onlyBChips = (g.only_b || []).map(t =>
-    `<span class="tag" style="font-size:11px;background:var(--bg-secondary)">${t}</span>`
-  ).join(' ');
+  const pairsHtml = (g.pairs || []).map(p => {
+    const nameA = p.schema_a.split('.').slice(1).join('.');
+    const nameB = p.schema_b.split('.').slice(1).join('.');
+    return `<tr>
+      <td title="${p.schema_a}">${_catalogBadge(p.schema_a)} ${nameA}</td>
+      <td title="${p.schema_b}">${_catalogBadge(p.schema_b)} ${nameB}</td>
+      <td style="text-align:center;font-weight:600;color:${similarityColor(p.table_similarity)}">${(p.table_similarity*100).toFixed(0)}%</td>
+      <td style="text-align:center">${(p.column_similarity*100).toFixed(0)}%</td>
+    </tr>`;
+  }).join('');
 
-  const hasDiff = (g.only_a?.length || 0) + (g.only_b?.length || 0) > 0;
+  const drillName = g.schemas[0]?.split('.').slice(1).join('.') || '';
 
   return `
     <div class="dup-group" style="margin-bottom:14px">
       <div class="dup-group-header" style="align-items:flex-start">
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <span style="display:flex;align-items:center;gap:6px">
-            ${_catalogBadge(g.schema_a)}
-            <strong style="font-size:13px">${nameA}</strong>
-          </span>
-          <span style="color:var(--text-muted);font-size:13px">\u2194</span>
-          <span style="display:flex;align-items:center;gap:6px">
-            ${_catalogBadge(g.schema_b)}
-            <strong style="font-size:13px">${nameB}</strong>
-          </span>
-          ${sameCat ? '<span class="tag" style="font-size:10px;opacity:0.7">same catalog</span>' : ''}
-        </div>
-        <div style="display:flex;gap:14px;align-items:center;flex-shrink:0">
-          <span style="font-size:12px;color:var(--text-muted)">
-            <span style="color:${tSimColor};font-weight:600">${tableSim}%</span> tables
-          </span>
-          <span style="font-size:12px;color:var(--text-muted)">
-            <span style="color:${cSimColor};font-weight:600">${colSim}%</span> columns
-          </span>
+        <div style="font-size:12px;color:var(--text-muted)">
+          <strong style="font-size:14px;color:var(--text)">${g.schemas.length}</strong>
+          schema${g.schemas.length !== 1 ? 's' : ''} &nbsp;·&nbsp;
+          <span style="color:${simColor};font-weight:600">${maxSim}%</span> max table sim
+          &nbsp;·&nbsp; ${avgSim}% avg
+          &nbsp;·&nbsp; ${maxColSim}% max col sim
         </div>
       </div>
 
       <div class="similarity-bar" style="margin:8px 0">
-        <div class="similarity-bar-fill" style="width:${tableSim}%;background:${tSimColor}"></div>
+        <div class="similarity-bar-fill" style="width:${maxSim}%;background:${simColor}"></div>
       </div>
 
-      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
-        ${g.table_count_a} tables in <strong>${nameA}</strong>
-        &nbsp;&nbsp;\u2194&nbsp;&nbsp;
-        ${g.table_count_b} tables in <strong>${nameB}</strong>
+      <div class="dup-tables-list" style="margin-bottom:10px">
+        ${schemaChips}
       </div>
 
       ${sharedChips ? `
         <div style="margin-bottom:8px">
-          <span style="font-size:11px;color:var(--text-muted);margin-right:6px">Shared:</span>
+          <span style="font-size:11px;color:var(--text-muted);margin-right:6px">Shared tokens:</span>
           ${sharedChips}
         </div>` : ''}
 
-      ${hasDiff ? `
+      ${pairsHtml ? `
         <details style="margin-top:6px">
           <summary style="cursor:pointer;font-size:12px;color:var(--text-muted);user-select:none;padding:2px 0">
-            Differences (${(g.only_a?.length||0) + (g.only_b?.length||0)} unique tokens)
+            Show ${g.pairs.length} pair${g.pairs.length !== 1 ? 's' : ''}
           </summary>
-          <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
-            ${onlyAChips ? `<div><span style="font-size:11px;color:var(--text-muted);margin-right:6px">Only in ${nameA}:</span>${onlyAChips}</div>` : ''}
-            ${onlyBChips ? `<div><span style="font-size:11px;color:var(--text-muted);margin-right:6px">Only in ${nameB}:</span>${onlyBChips}</div>` : ''}
-          </div>
+          <table class="data-table" style="margin-top:8px;font-size:12px">
+            <thead><tr><th>Schema A</th><th>Schema B</th><th>Table sim</th><th>Col sim</th></tr></thead>
+            <tbody>${pairsHtml}</tbody>
+          </table>
         </details>` : ''}
+
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;justify-content:flex-end">
+        <button class="btn btn-outline btn-sm" onclick="drillToGroups('${drillName}')">
+          View table groups &rarr;
+        </button>
+      </div>
     </div>`;
 }
 
 
 function renderSchemaCompact(groups) {
   const rows = groups.map(g => {
-    const nameA  = g.schema_a.split('.').slice(1).join('.');
-    const nameB  = g.schema_b.split('.').slice(1).join('.');
-    const tColor = similarityColor(g.table_similarity);
-    const cColor = similarityColor(g.column_similarity);
+    const simColor = similarityColor(g.max_table_similarity);
+    const colColor = similarityColor(g.max_column_similarity);
+    const drillName = g.schemas[0]?.split('.').slice(1).join('.') || '';
+
+    // Show first 3 schemas with catalog badges, then "+N more"
+    const shown = g.schemas.slice(0, 3).map(s =>
+      `${_catalogBadge(s)} <span style="font-size:11px">${s.split('.').slice(1).join('.')}</span>`
+    ).join(' ');
+    const extra = g.schemas.length > 3
+      ? ` <span style="font-size:11px;color:var(--text-muted)">+${g.schemas.length - 3} more</span>`
+      : '';
+
+    const sharedPreview = (g.shared_tokens || []).slice(0, 4).map(t =>
+      `<span class="tag tag-accent" style="font-size:10px">${t}</span>`
+    ).join(' ');
+
     return `<tr>
-      <td title="${g.schema_a}">${_catalogBadge(g.schema_a)} <span style="font-size:12px">${nameA}</span></td>
-      <td title="${g.schema_b}">${_catalogBadge(g.schema_b)} <span style="font-size:12px">${nameB}</span></td>
-      <td style="text-align:center;font-weight:600;color:${tColor}">${(g.table_similarity*100).toFixed(0)}%</td>
-      <td style="text-align:center;font-weight:600;color:${cColor}">${(g.column_similarity*100).toFixed(0)}%</td>
-      <td style="text-align:center;color:var(--text-muted)">${g.table_count_a} / ${g.table_count_b}</td>
-      <td style="font-size:11px">${(g.shared_tokens||[]).slice(0,5).map(t=>`<span class="tag tag-accent" style="font-size:10px">${t}</span>`).join(' ')}${g.shared_tokens?.length>5?` <span style="color:var(--text-muted)">+${g.shared_tokens.length-5}</span>`:''}</td>
+      <td style="font-size:11px">${shown}${extra}</td>
+      <td style="text-align:center">${g.schemas.length}</td>
+      <td style="text-align:center;font-weight:600;color:${simColor}">${(g.max_table_similarity*100).toFixed(0)}%</td>
+      <td style="text-align:center;font-weight:600;color:${colColor}">${(g.max_column_similarity*100).toFixed(0)}%</td>
+      <td style="font-size:11px">${sharedPreview}</td>
+      <td><button class="btn btn-outline btn-sm" style="font-size:11px;padding:2px 7px"
+        onclick="drillToGroups('${drillName}')">&rarr;</button></td>
     </tr>`;
   }).join('');
 
   return `
     <table class="data-table">
       <thead><tr>
-        <th>Schema A</th><th>Schema B</th>
-        <th>Table sim</th><th>Col sim</th>
-        <th>Tables A/B</th><th>Shared tokens</th>
+        <th>Schemas</th><th>Count</th>
+        <th>Max table sim</th><th>Max col sim</th>
+        <th>Shared tokens</th><th></th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
-
 
 function renderDupInfo() {
   const tabNav = buildDupTabNav();
@@ -1179,9 +1365,9 @@ async function renderDuplicates() {
 
   const tabNav = `
     <div style="display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0">
-      ${['groups','heatmap','owners','schemas','info'].map(t => `
+      ${['schemas','groups','heatmap','owners','info'].map(t => `
         <button onclick="state.duplicatesTab='${t}';renderDuplicates()" style="padding:7px 16px;font-size:13px;font-weight:${state.duplicatesTab===t?'600':'400'};border:none;background:none;cursor:pointer;color:${state.duplicatesTab===t?'var(--accent)':'var(--text-muted)'};border-bottom:2px solid ${state.duplicatesTab===t?'var(--accent)':'transparent'};margin-bottom:-1px">
-          ${{groups:'Groups',heatmap:'Heatmap',owners:'Owners',schemas:'Schemas',info:'Info'}[t]}
+          ${{schemas:'Schemas',groups:'Objects',heatmap:'Heatmap',owners:'Owners',info:'Info'}[t]}
         </button>`).join('')}
     </div>`;
 
