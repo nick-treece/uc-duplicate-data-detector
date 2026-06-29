@@ -46,6 +46,7 @@ let state = {
   dismissedKeys: new Map(),   // group_key → {group_type, rationale, dismissed_at}
   groupsPageSize: 50,
   groupsShown: 50,
+  catalogFilter: '',
   cacheLoading: true,   // true during initial cache check on startup
 };
 
@@ -602,14 +603,34 @@ async function renderCatalog() {
     <h2 class="page-title">Catalog Explorer</h2>
     <p class="page-desc">Browsing <strong>${catalogs.length}</strong> catalog${catalogs.length !== 1 ? 's' : ''}. Click a table to see its metadata and permissions.</p>
     <div class="tree-container">
-      <div class="tree-panel" id="tree-panel">${renderTree(catalogs)}</div>
+      <div class="tree-panel" id="tree-panel">
+        <div style="position:sticky;top:0;z-index:10;background:var(--bg-card);padding:10px 12px;border-bottom:1px solid var(--border);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
+          <input type="text" id="catalog-filter"
+            placeholder="Filter catalogs, schemas and tables\u2026"
+            value="${state.catalogFilter}"
+            style="width:100%;box-sizing:border-box;padding:6px 10px;font-size:13px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+        </div>
+        <div id="tree-content">${renderTree(catalogs, state.catalogFilter)}</div>
+      </div>
       <div class="detail-panel" id="detail-panel">
         <div class="empty-state"><h3>Select a table</h3><p>Click on a table in the tree to view details.</p></div>
       </div>
     </div>
   `;
 
-  $('tree-panel').onclick = async (e) => {
+  // Filter input — debounced re-render of tree only
+  let _catFilterTimer;
+  document.getElementById('catalog-filter').addEventListener('input', e => {
+    clearTimeout(_catFilterTimer);
+    _catFilterTimer = setTimeout(() => {
+      state.catalogFilter = e.target.value;
+      document.getElementById('tree-content').innerHTML =
+        renderTree(catalogs, state.catalogFilter);
+    }, 250);
+  });
+
+  document.getElementById('tree-panel').addEventListener('click', async e => {
+    // Table click → load detail
     const tableEl = e.target.closest('.tree-table');
     if (tableEl) {
       const { catalog, schema, table } = tableEl.dataset;
@@ -623,47 +644,87 @@ async function renderCatalog() {
       } catch (e) {
         $('detail-panel').innerHTML = `<div class="empty-state"><h3>Error</h3><p>${e.message}</p></div>`;
       }
+      return;
     }
+
+    // Toggle click → expand / collapse
     const toggle = e.target.closest('.tree-toggle');
     if (toggle) {
+      const parent   = toggle.parentElement;
       const children = toggle.nextElementSibling;
-      if (children) children.style.display = children.style.display === 'none' ? 'block' : 'none';
+      if (children) {
+        const opening = children.style.display === 'none';
+        children.style.display = opening ? 'block' : 'none';
+        parent.classList.toggle('open', opening);
+      }
     }
-  };
+  });
 }
 
-function renderTree(catalogs) {
-  return catalogs.map(catName => {
-    const catSchemas = state.schemas.filter(s => s.catalog === catName);
+function renderTree(catalogs, query = '', idx = null) {
+  const q = (query || '').toLowerCase().trim();
+
+  // Fall back to linear scan if no index supplied (shouldn't happen in normal flow)
+  const getSchemas = idx
+    ? cat => idx.schemasByCatalog.get(cat) || []
+    : cat => state.schemas.filter(s => s.catalog === cat);
+  const getTables = idx
+    ? (cat, sch) => idx.tablesBySchema.get(`${cat}\0${sch}`) || []
+    : (cat, sch) => state.tables.filter(t => t.catalog === cat && t.schema === sch);
+  const catLc = idx ? idx.catalogsLc : catalogs.map(c => c.toLowerCase());
+
+  return catalogs.map((catName, ci) => {
+    const catSchemas = getSchemas(catName);
+    const catMatch   = catLc[ci].includes(q);
+
+    const visibleSchemas = catSchemas.map(s => {
+      const tables   = getTables(catName, s.name);
+      const schMatch = s._lc ? s._lc.includes(q) : s.name.toLowerCase().includes(q);
+      const matchTables = (q && !catMatch && !schMatch)
+        ? tables.filter(t => (t._lc || t.name.toLowerCase()).includes(q))
+        : tables;
+      const visible = !q || catMatch || schMatch || matchTables.length > 0;
+      const expand  = q && (schMatch || matchTables.length > 0);
+      return { s, tables, matchTables, visible, expand };
+    }).filter(r => r.visible);
+
+    if (q && !catMatch && visibleSchemas.length === 0) return '';
+
+    const catExpand = q && (catMatch || visibleSchemas.length > 0);
+
+    const schemaHtml = visibleSchemas.map(({ s, tables, matchTables, expand }) => {
+      const schLc = s._lc || s.name.toLowerCase();
+      const displayTables = (q && !catMatch && !schLc.includes(q)) ? matchTables : tables;
+      return `
+        <div class="tree-schema${expand ? ' open' : ''}">
+          <div class="tree-toggle tree-schema-name">
+            <span class="tree-caret">&#9654;</span>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+            ${s.name}
+            <span class="count">${s.table_count}</span>
+          </div>
+          <div class="tree-tables" style="display:${expand ? 'block' : 'none'}">
+            ${displayTables.map(t =>
+              `<div class="tree-table" data-catalog="${catName}" data-schema="${t.schema}" data-table="${t.name}">${t.name}</div>`
+            ).join('')}
+          </div>
+        </div>`;
+    }).join('');
+
     return `
-      <div class="tree-catalog">
+      <div class="tree-catalog${catExpand ? ' open' : ''}">
         <div class="tree-toggle tree-catalog-name">
+          <span class="tree-caret">&#9654;</span>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
           ${catName}
           <span class="count">${catSchemas.length}</span>
         </div>
-        <div class="tree-catalog-children">
-          ${catSchemas.map(s => {
-            const tables = state.tables.filter(t => t.catalog === catName && t.schema === s.name);
-            return `
-              <div class="tree-schema">
-                <div class="tree-toggle tree-schema-name">
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
-                  ${s.name}
-                  <span class="count">${s.table_count}</span>
-                </div>
-                <div class="tree-tables">
-                  ${tables.map(t => `<div class="tree-table" data-catalog="${catName}" data-schema="${t.schema}" data-table="${t.name}">${t.name}</div>`).join('')}
-                </div>
-              </div>
-            `;
-          }).join('')}
+        <div class="tree-catalog-children" style="display:${catExpand ? 'block' : 'none'}">
+          ${schemaHtml}
         </div>
-      </div>
-    `;
-  }).join('');
+      </div>`;
+  }).filter(Boolean).join('');
 }
-
 function renderTableDetail(info) {
   const dp = $('detail-panel');
   dp.innerHTML = `
@@ -683,6 +744,22 @@ function renderTableDetail(info) {
     </div>
 
     <div class="section">
+      <div style="cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between"
+           onclick="toggleTableLineage(this,'${info.catalog}','${info.schema_name || info.schema}','${info.name}')">
+        <div class="section-title" style="margin:0">Lineage Graph</div>
+        <span id="tl-toggle-hint" style="font-size:12px;color:var(--text-muted)">&#9654; expand</span>
+      </div>
+      <div id="table-lineage-container" style="display:none;margin-top:12px">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:12px;color:var(--text-muted)">
+          <button class="btn btn-outline btn-sm" onclick="adjustTableLineageDepth(-1)">&#8722; fewer generations</button>
+          <span id="tl-depth-label">Depth: 3</span>
+          <button class="btn btn-outline btn-sm" onclick="adjustTableLineageDepth(1)">&#43; more generations</button>
+        </div>
+        <div id="table-lineage-graph" style="width:100%;height:500px;overflow:hidden;border:1px solid var(--border);border-radius:8px;background:var(--bg)"></div>
+      </div>
+    </div>
+
+    <div class="section">
       <div class="section-title">Columns</div>
       <table class="data-table">
         <thead><tr><th>#</th><th>Name</th><th>Type</th><th>Nullable</th></tr></thead>
@@ -699,6 +776,56 @@ function renderTableDetail(info) {
       </table>
     </div>
   `;
+}
+
+// ===== Table Lineage Graph =====
+
+let _tlDepth = 3;
+let _tlTable = null;  // { catalog, schema, name }
+let _tlLoaded = false;
+
+function toggleTableLineage(headerEl, catalog, schema, table) {
+  const container = document.getElementById('table-lineage-container');
+  const hint      = document.getElementById('tl-toggle-hint');
+  if (!container) return;
+  const opening = container.style.display === 'none';
+  container.style.display = opening ? 'block' : 'none';
+  if (hint) hint.innerHTML = opening ? '&#9660; collapse' : '&#9654; expand';
+  if (opening) {
+    _tlTable  = { catalog, schema, name: table };
+    _tlLoaded = false;
+    loadTableLineageGraph();
+  }
+}
+
+function adjustTableLineageDepth(delta) {
+  _tlDepth = Math.max(1, Math.min(8, _tlDepth + delta));
+  const label = document.getElementById('tl-depth-label');
+  if (label) label.textContent = `Depth: ${_tlDepth}`;
+  loadTableLineageGraph();
+}
+
+async function loadTableLineageGraph() {
+  const graphEl = document.getElementById('table-lineage-graph');
+  if (!graphEl || !_tlTable) return;
+  const { catalog, schema, name } = _tlTable;
+  graphEl.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">Loading lineage…</div>';
+  try {
+    const resp = await fetch(`/api/catalog/table-lineage/${catalog}/${schema}/${name}?depth=${_tlDepth}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (!data.nodes || data.nodes.length <= 1) {
+      graphEl.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-muted)">No lineage data available for this table.</div>';
+      return;
+    }
+    if (typeof d3 === 'undefined' || typeof dagre === 'undefined') {
+      graphEl.innerHTML = '<div style="text-align:center;padding:40px;color:var(--red)">Graph libraries not loaded.</div>';
+      return;
+    }
+    renderDagreGraph(graphEl, data);
+  } catch(e) {
+    graphEl.innerHTML = `<div style="text-align:center;padding:40px;color:var(--red)">Failed to load lineage: ${e.message}</div>`;
+  }
 }
 
 function renderFilterSummary() {
@@ -2485,8 +2612,8 @@ async function loadLineageGraph() {
 }
 
 function renderDagreGraph(container, data) {
-  const width = container.clientWidth || 900;
-  const height = 500;
+  const width  = container.clientWidth  || 900;
+  const height = container.clientHeight || 500;
 
   // Tier colours
   const tierColors = {

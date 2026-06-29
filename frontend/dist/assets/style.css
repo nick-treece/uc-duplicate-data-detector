@@ -366,7 +366,7 @@ body {
 /* ===== Catalog Tree ===== */
 .tree-container {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 360px 1fr;
   gap: 20px;
 }
 
@@ -374,7 +374,7 @@ body {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
-  padding: 12px;
+  padding: 0;
   max-height: calc(100vh - 150px);
   overflow-y: auto;
 }
@@ -718,3 +718,36 @@ select:focus, input:focus { outline: none; border-color: var(--accent); }
 .access-group .access-group-members { display: none !important; }
 .access-group.expanded .access-group-members { display: block !important; }
 .access-group.expanded .access-chevron { transform: rotate(90deg); }
+
+/* Catalog tree caret */
+.tree-caret {
+  display: inline-block;
+  font-size: 9px;
+  margin-right: 5px;
+  color: var(--text-dim);
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+.tree-catalog.open > .tree-catalog-name .tree-caret,
+.tree-schema.open  > .tree-schema-name  .tree-caret {
+  transform: rotate(90deg);
+}
+
+/* Themed scrollbars */
+.tree-panel::-webkit-scrollbar,
+.detail-panel::-webkit-scrollbar { width: 5px; }
+
+.tree-panel::-webkit-scrollbar-track,
+.detail-panel::-webkit-scrollbar-track { background: transparent; }
+
+.tree-panel::-webkit-scrollbar-thumb,
+.detail-panel::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.tree-panel::-webkit-scrollbar-thumb:hover,
+.detail-panel::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* Tree content inner padding */
+#tree-content { padding: 8px 12px 12px; }
