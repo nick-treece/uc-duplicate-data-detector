@@ -678,13 +678,18 @@ function renderTree(catalogs, query = '', idx = null) {
     const catMatch   = catLc[ci].includes(q);
 
     const visibleSchemas = catSchemas.map(s => {
-      const tables   = getTables(catName, s.name);
-      const schMatch = s._lc ? s._lc.includes(q) : s.name.toLowerCase().includes(q);
-      const matchTables = (q && !catMatch && !schMatch)
+      const tables        = getTables(catName, s.name);
+      const schMatch      = s._lc ? s._lc.includes(q) : s.name.toLowerCase().includes(q);
+      // Tables that specifically match the query text
+      const specificMatches = q
         ? tables.filter(t => (t._lc || t.name.toLowerCase()).includes(q))
-        : tables;
-      const visible = !q || catMatch || schMatch || matchTables.length > 0;
-      const expand  = q && (schMatch || matchTables.length > 0);
+        : [];
+      // What to display: all tables when parent (catalog/schema) matched, filtered otherwise
+      const matchTables = (!q || catMatch || schMatch) ? tables : specificMatches;
+      const visible = !q || catMatch || schMatch || specificMatches.length > 0;
+      // Expand only when THIS schema or one of ITS tables specifically matched —
+      // NOT just because the parent catalog name matched
+      const expand  = q && (schMatch || specificMatches.length > 0);
       return { s, tables, matchTables, visible, expand };
     }).filter(r => r.visible);
 
@@ -693,8 +698,7 @@ function renderTree(catalogs, query = '', idx = null) {
     const catExpand = q && (catMatch || visibleSchemas.length > 0);
 
     const schemaHtml = visibleSchemas.map(({ s, tables, matchTables, expand }) => {
-      const schLc = s._lc || s.name.toLowerCase();
-      const displayTables = (q && !catMatch && !schLc.includes(q)) ? matchTables : tables;
+      const displayTables = matchTables;  // already correct: all tables when parent matched, specific matches otherwise
       return `
         <div class="tree-schema${expand ? ' open' : ''}">
           <div class="tree-toggle tree-schema-name">
