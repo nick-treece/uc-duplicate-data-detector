@@ -88,6 +88,10 @@ def cache_load():
         # Store groups so /api/duplicates/groups can serve them
         scanner.set_duplicate_groups(groups)
 
+        # Load and restore schema groups from cache
+        schema_groups = cache_manager.load_schema_groups()
+        scanner.set_schema_groups(schema_groups)
+
         return {
             "scan_result": scan_result,
             "groups": groups,

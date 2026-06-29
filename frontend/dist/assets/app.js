@@ -14,13 +14,15 @@ let state = {
   selectedTable: null,
   compareResult: null,
   threshold: 0.5,
-  cacheInfo: null,   // { cached_at, age_days } when loaded from cache
+  cacheInfo: null,
+  cacheInvalidReason: null,   // { cached_at, age_days } when loaded from cache
   filters: {
     hideGovernanceViews: true,
     hidePipelineStages: true,
     hideSharedSource: false,
     catalogPrefix: '',
     catalogPrefixMode: 'any',
+    catalogPair: null,       // [catA, catB] — set when drilling from heatmap
     minGroupSize: 2,
     crossCatalogOnly: false,
     showDismissed: false,
@@ -35,10 +37,13 @@ let state = {
   },
   sortBy: 'score',
   compactView: false,
-  duplicatesTab: 'groups',
+  duplicatesTab: 'schemas',
   schemaGroups: null,   // null = not loaded, [] = loaded
   schemasCompact: false,
+  heatmapMinGroups: 0,
   schemasThreshold: 0.7,
+  schemasFilters: { search: '', minTableSim: 0, maxTableSim: 100, catalogPrefix: '', catalogPrefixMode: 'any', minTables: 0, showDismissed: false },
+  dismissedKeys: new Map(),   // group_key → {group_type, rationale, dismissed_at}
   groupsPageSize: 50,
   groupsShown: 50,
   cacheLoading: true,   // true during initial cache check on startup
@@ -74,9 +79,12 @@ async function tryLoadFromCache() {
 
     const status = await API.cacheStatus();
     if (!status.valid) {
-      console.log('Cache not valid:', status.reason);
+      state.cacheInvalidReason = status.reason;
+      try { const d = await API.getDismissed(); state.dismissedKeys = new Map(d.map(r => [r.group_key, r])); } catch {}
       return;
     }
+    state.cacheInvalidReason = null;
+    try { const d = await API.getDismissed(); state.dismissedKeys = new Map(d.map(r => [r.group_key, r])); } catch {}
 
     state.scanProgress = { message: 'Cache found \u2014 loading scan results\u2026' };
     renderDashboard();
@@ -174,20 +182,70 @@ function undismissGroup(g) {
   keys.delete(groupKey(g));
   saveDismissedKeys(keys);
 }
+function schemaGroupKey(g) {
+  return 'sg:' + g.schemas.slice().sort().join(',');
+}
+
+function showDismissModal(onConfirm) {
+  const existing = document.getElementById('dismiss-modal-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'dismiss-modal-overlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.65);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:24px;width:440px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.5)">
+      <h3 style="margin:0 0 8px;font-size:16px;color:var(--text)">Dismiss this group?</h3>
+      <p style="font-size:13px;color:var(--text-muted);margin:0 0 14px">
+        A reason is required. This is stored permanently and survives cache refreshes.
+      </p>
+      <textarea id="dismiss-rationale-input"
+        placeholder="e.g. Known migration artifact, planned consolidation, intentional copy…"
+        style="width:100%;height:88px;font-size:13px;padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);resize:vertical;box-sizing:border-box;margin-top:4px"></textarea>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+        <button id="dismiss-modal-cancel" class="btn btn-outline">Cancel</button>
+        <button id="dismiss-modal-confirm" class="btn btn-primary" disabled>Dismiss</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const textarea = document.getElementById('dismiss-rationale-input');
+  const confirmBtn = document.getElementById('dismiss-modal-confirm');
+
+  textarea.addEventListener('input', () => {
+    confirmBtn.disabled = textarea.value.trim().length === 0;
+  });
+  document.getElementById('dismiss-modal-cancel').addEventListener('click', () => overlay.remove());
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  confirmBtn.addEventListener('click', () => {
+    const rationale = textarea.value.trim();
+    if (!rationale) return;
+    overlay.remove();
+    onConfirm(rationale);
+  });
+  textarea.focus();
+}
+
+async function performDismiss(key, groupType) {
+  state.dismissedKeys.set(key, { group_type: groupType, rationale: '…' });
+  renderDuplicates();
+  try {
+    const record = state.dismissedKeys.get(key);
+    await API.dismissGroup(key, groupType, record.rationale);
+  } catch (e) { console.warn('Dismiss persist failed:', e); }
+}
+
+async function performUndismiss(key) {
+  state.dismissedKeys.delete(key);
+  renderDuplicates();
+  try { await API.undismissGroup(key); }
+  catch (e) { console.warn('Undismiss persist failed:', e); }
+}
+
+
 
 // ===== Group Filtering =====
 function applyGroupFilters(groups) {
-  console.log('[FILTER] input groups:', groups.length,
-    '| threshold:', state.threshold,
-    '| filters:', JSON.stringify(state.filters));
-
-  if (groups.length && state.filters.catalogPrefix) {
-    const prefix = state.filters.catalogPrefix.toLowerCase();
-    const sample = groups[0];
-    console.log('[FILTER] sample group tables:', sample.tables,
-      '| first catalog:', sample.tables[0]?.split('.')[0],
-      '| prefix test:', sample.tables[0]?.split('.')[0]?.toLowerCase().startsWith(prefix));
-  }
 
   const result = groups.filter(g => {
     const tags = g.tags || [];
@@ -201,8 +259,7 @@ function applyGroupFilters(groups) {
     if (state.filters.hideSharedSource && tags.includes('shared_source'))
       return false;
 
-    const dismissed = getDismissedKeys();
-    if (!state.filters.showDismissed && dismissed.has(groupKey(g)))
+    if (!state.filters.showDismissed && state.dismissedKeys.has(groupKey(g)))
       return false;
 
     if (state.filters.minGroupSize > 2 && g.tables.length < state.filters.minGroupSize)
@@ -250,10 +307,15 @@ function applyGroupFilters(groups) {
       if (!hasMatch) return false;
     }
 
+    if (state.filters.catalogPair) {
+      const [catA, catB] = state.filters.catalogPair;
+      const groupCats = new Set(g.tables.map(t => t.split('.')[0]));
+      if (!groupCats.has(catA) || !groupCats.has(catB)) return false;
+    }
+
     return true;
   });
 
-  console.log('[FILTER] result:', result.length);
   return result;
 }
 
@@ -296,6 +358,10 @@ async function renderDashboard() {
   main().innerHTML = `
     <h2 class="page-title">Dashboard</h2>
     <p class="page-desc">Scan all accessible Unity Catalog metadata, detect duplicate datasets, and identify gold-standard tables.</p>
+    ${state.cacheInvalidReason && !state.cacheLoading && !state.scanned ? `<div class="card" style="margin-bottom:16px;padding:12px;display:flex;align-items:center;gap:8px;border-left:3px solid var(--yellow, #f59e0b)">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--yellow, #f59e0b)" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      <span style="font-size:13px;color:var(--text-muted)"><strong style="color:var(--text)">Cache is out of date</strong> \u2014 ${state.cacheInvalidReason}. A fresh scan is needed to reload duplicate groups.</span>
+    </div>` : ''}
     ${state.cacheInfo ? `<div class="card" style="margin-bottom:16px;padding:12px;display:flex;align-items:center;gap:8px;border-left:3px solid var(--green)">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
       <span style="font-size:13px;color:var(--text-muted)">Loaded from cache \u2014 <strong>${Math.floor(state.cacheInfo.age_days)}d ago</strong>.
@@ -350,7 +416,8 @@ function renderScanSummary(sr) {
       <div class="stat-card"><div class="stat-label">Schemas</div><div class="stat-value">${t.schema_count}</div></div>
       <div class="stat-card"><div class="stat-label">Tables</div><div class="stat-value">${t.table_count}</div></div>
       <div class="stat-card"><div class="stat-label">Columns</div><div class="stat-value">${t.column_count}</div></div>
-      <div class="stat-card"><div class="stat-label">Duplicate Groups</div><div class="stat-value accent">${filteredGroupsInfo().filtered.length}${filteredGroupsInfo().hidden ? ` <span style="font-size:12px;font-weight:400;color:var(--text-muted)">(${filteredGroupsInfo().hidden} hidden)</span>` : ''}</div></div>
+      <div class="stat-card"><div class="stat-label">Duplicate Object Groups</div><div class="stat-value accent">${filteredGroupsInfo().filtered.length}${filteredGroupsInfo().hidden ? ` <span style="font-size:12px;font-weight:400;color:var(--text-muted)">(${filteredGroupsInfo().hidden} hidden)</span>` : ''}</div></div>
+      <div class="stat-card"><div class="stat-label">Duplicate Schema Groups</div><div class="stat-value accent">${state.schemaGroups !== null ? (state.schemaGroups || []).length : '<span style="color:var(--text-muted);font-size:14px">&mdash;</span>'}</div></div>
     </div>
     <div class="section" style="margin-top:20px">
       <div class="section-title">Catalogs</div>
@@ -638,7 +705,7 @@ function renderFilterSummary() {
   const f = state.filters;
   const defaults = {
     hideGovernanceViews: true, hidePipelineStages: true, hideSharedSource: false,
-    catalogPrefix: '', minGroupSize: 2, crossCatalogOnly: false,
+    catalogPrefix: '', catalogPair: null, minGroupSize: 2, crossCatalogOnly: false,
     showDismissed: false, searchQuery: '',
   };
 
@@ -647,6 +714,7 @@ function renderFilterSummary() {
   if (!f.hidePipelineStages)   chips.push({ label: 'Showing pipeline stages',  key: 'hidePipelineStages',  value: true });
   if (f.hideSharedSource)      chips.push({ label: 'Hiding shared-source',      key: 'hideSharedSource',    value: false });
   if (f.crossCatalogOnly)      chips.push({ label: 'Cross-catalog only',        key: 'crossCatalogOnly',    value: false });
+  if (f.catalogPair)           chips.push({ label: `⇔ ${f.catalogPair[0].split('_').slice(-2).join('_')} × ${f.catalogPair[1].split('_').slice(-2).join('_')}`, key: 'catalogPair', value: null });
   if (f.showDismissed)         chips.push({ label: 'Showing dismissed',         key: 'showDismissed',       value: false });
   if (f.minGroupSize > 2)      chips.push({ label: `Min size: ${f.minGroupSize}`, key: 'minGroupSize',      value: 2 });
   if (f.searchQuery)           chips.push({ label: `Search: "${f.searchQuery}"`,  key: 'searchQuery',       value: '' });
@@ -674,13 +742,121 @@ function renderFilterSummary() {
     </div>`;
 }
 
+
+// ===== Dismissed Tab =====
+
+function renderDismissedContent() {
+  const tabNav  = buildDupTabNav();
+  const content = renderDismissedTab();
+  main().innerHTML = `
+    <h2 class="page-title">Duplicate Detection</h2>
+    ${tabNav}
+    <div style="margin-top:16px">${content}</div>`;
+}
+
+function renderDismissedTab() {
+  const entries = [...state.dismissedKeys.entries()];
+
+  if (!entries.length) {
+    return `<div class="empty-state">
+      <h3>No dismissed groups</h3>
+      <p>Use the Dismiss button on any group card to hide it from the default view.</p>
+    </div>`;
+  }
+
+  const schemaEntries = entries.filter(([, v]) => v.group_type === 'schema');
+  const objectEntries = entries.filter(([, v]) => v.group_type !== 'schema');
+
+  function formatDate(dt) {
+    if (!dt) return '';
+    try { return new Date(dt).toLocaleDateString(); } catch { return ''; }
+  }
+
+  function schemaDismissCard([key, record]) {
+    const schemas = key.replace(/^sg:/, '').split(',');
+    const label   = schemas[0]?.split('.')?.[1] || key;
+    const chips   = schemas.slice(0, 6).map(s =>
+      `<span class="dup-table-tag" style="font-size:11px">${s}</span>`
+    ).join('') + (schemas.length > 6
+      ? `<span class="dup-table-tag" style="font-size:11px;opacity:0.6">+${schemas.length - 6} more</span>`
+      : '');
+    const date = formatDate(record.dismissed_at);
+    return `
+      <div class="dup-group" style="margin-bottom:10px">
+        <div class="dup-group-header">
+          <div>
+            <div style="font-weight:600;font-size:14px;color:var(--text)">${label}</div>
+            <div style="font-size:12px;color:var(--text-muted)">${schemas.length} schema${schemas.length !== 1 ? 's' : ''}</div>
+          </div>
+          <button class="btn btn-outline btn-sm schema-undismiss-btn" data-sgkey="${key}"
+            style="font-size:11px;padding:2px 8px">Restore</button>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin:6px 0;font-style:italic">
+          "${record.rationale || '—'}"${date ? ` &nbsp;·&nbsp; ${date}` : ''}
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:4px">${chips}</div>
+      </div>`;
+  }
+
+  function objectDismissCard([key, record]) {
+    const tables = key.split(',');
+    const chips  = tables.slice(0, 5).map(t =>
+      `<span class="dup-table-tag" style="font-size:11px">${t}</span>`
+    ).join('') + (tables.length > 5
+      ? `<span class="dup-table-tag" style="font-size:11px;opacity:0.6">+${tables.length - 5} more</span>`
+      : '');
+    const date = formatDate(record.dismissed_at);
+    return `
+      <div class="dup-group" style="margin-bottom:10px">
+        <div class="dup-group-header">
+          <span class="dup-group-title">${tables.length} table${tables.length !== 1 ? 's' : ''}</span>
+          <button class="btn btn-outline btn-sm undismiss-btn" data-key="${key}"
+            style="font-size:11px;padding:2px 8px">Restore</button>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted);margin:6px 0;font-style:italic">
+          "${record.rationale || '—'}"${date ? ` &nbsp;·&nbsp; ${date}` : ''}
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:4px">${chips}</div>
+      </div>`;
+  }
+
+  let html = '';
+
+  if (schemaEntries.length) {
+    html += `<h3 style="font-size:14px;font-weight:600;color:var(--text-muted);margin:0 0 10px;text-transform:uppercase;letter-spacing:0.05em">
+      Schema groups &mdash; ${schemaEntries.length}
+    </h3>`;
+    html += schemaEntries.map(schemaDismissCard).join('');
+  }
+
+  if (objectEntries.length) {
+    html += `<h3 style="font-size:14px;font-weight:600;color:var(--text-muted);margin:${schemaEntries.length ? '20px' : '0'} 0 10px;text-transform:uppercase;letter-spacing:0.05em">
+      Object groups &mdash; ${objectEntries.length}
+    </h3>`;
+    html += objectEntries.map(objectDismissCard).join('');
+  }
+
+  return html;
+}
+
+function heatmapDrillTo(catA, catB) {
+  state.filters.catalogPair = [catA, catB].sort();
+  state.duplicatesTab = 'groups';
+  renderDuplicates();
+}
+
 function renderHeatmap() {
-  // Aggregate: for each cross-catalog pair, count how many groups span both
-  const matrix = {};
+  const f       = state.filters;
+  const groups  = applyGroupFilters(state.groups);   // respects active filters
+  const minShow = state.heatmapMinGroups || 0;
+
+  // Build matrix — only cross-catalog groups contribute rows/columns
+  const matrix     = {};
   const catalogSet = new Set();
 
-  for (const g of state.groups) {
+  for (const g of groups) {
     const cats = [...new Set(g.tables.map(t => t.split('.')[0]))];
+    if (cats.length < 2) continue;            // skip single-catalog groups
     cats.forEach(c => catalogSet.add(c));
     for (let i = 0; i < cats.length; i++) {
       for (let j = i + 1; j < cats.length; j++) {
@@ -690,38 +866,108 @@ function renderHeatmap() {
     }
   }
 
-  const catalogs = [...catalogSet].sort();
-  const maxVal = Math.max(1, ...Object.values(matrix));
+  // Prune to catalogs that have at least one visible cell
+  const threshold = Math.max(1, minShow);
+  const allCats   = [...catalogSet].sort();
+  const catalogs  = allCats.filter(cat =>
+    allCats.some(other => other !== cat && (matrix[[cat, other].sort().join('|||')] || 0) >= threshold)
+  );
+  const maxVal    = Math.max(1, ...Object.values(matrix));
+  const tabNav    = buildDupTabNav();
+  const totalAll  = state.groups.filter(g =>
+    [...new Set(g.tables.map(t => t.split('.')[0]))].length > 1
+  ).length;
+  const totalFiltered = groups.filter(g =>
+    [...new Set(g.tables.map(t => t.split('.')[0]))].length > 1
+  ).length;
 
-  const tabNav = buildDupTabNav();
-  const headerCells = catalogs.map(c => `<th style="font-size:10px;padding:4px 6px;writing-mode:vertical-rl;text-align:left;max-width:24px;overflow:hidden;color:var(--text-muted)">${c.split('_').slice(-2).join('_')}</th>`).join('');
+  // ── Filter bar ────────────────────────────────────────────────────────────
+  const inputStyle = 'width:58px;padding:3px 6px;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)';
+  const filterBar  = `
+    <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--border);margin-bottom:14px;font-size:12px;color:var(--text-muted)">
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+        <input type="checkbox" id="hm-gov"  ${f.hideGovernanceViews ? 'checked' : ''}> Hide governance views
+      </label>
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+        <input type="checkbox" id="hm-pipe" ${f.hidePipelineStages  ? 'checked' : ''}> Hide pipeline stages
+      </label>
+      <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+        <input type="checkbox" id="hm-shared" ${f.hideSharedSource  ? 'checked' : ''}> Hide shared source
+      </label>
+      <label style="display:flex;align-items:center;gap:5px">
+        Min tables per group
+        <input type="number" id="hm-size" value="${f.minGroupSize}" min="2" style="${inputStyle}">
+      </label>
+      <label style="display:flex;align-items:center;gap:5px">
+        Min groups per cell
+        <input type="number" id="hm-min" value="${minShow}" min="0" style="${inputStyle}">
+      </label>
+      <span style="margin-left:auto;font-style:italic">
+        ${totalFiltered < totalAll ? `${totalFiltered} of ${totalAll} cross-catalog groups` : `${totalAll} cross-catalog groups`}
+        &nbsp;&middot;&nbsp; ${catalogs.length} catalogs
+      </span>
+    </div>`;
+
+  // ── Grid ──────────────────────────────────────────────────────────────────
+  const headerCells = catalogs.map(c =>
+    `<th style="font-size:10px;padding:4px 6px;writing-mode:vertical-rl;text-align:left;max-width:24px;overflow:hidden;color:var(--text-muted)"
+      title="${c}">${c.split('_').slice(-2).join('_')}</th>`
+  ).join('');
+
   const rows = catalogs.map(rowCat => {
     const cells = catalogs.map(colCat => {
-      if (rowCat === colCat) return `<td style="background:var(--bg-secondary);opacity:0.3"></td>`;
+      if (rowCat === colCat)
+        return `<td style="background:var(--bg);opacity:0.2;padding:6px"></td>`;
       const key = [rowCat, colCat].sort().join('|||');
       const val = matrix[key] || 0;
-      if (!val) return `<td style="background:var(--bg-secondary)"></td>`;
-      const intensity = Math.round((val / maxVal) * 200);
-      return `<td style="background:rgba(239,68,68,${val/maxVal*0.8});text-align:center;font-size:11px;font-weight:600;cursor:pointer;color:#fff" title="${rowCat} ↔ ${colCat}: ${val} group${val!==1?'s':''}">${val}</td>`;
+      if (!val || val < minShow)
+        return `<td style="background:var(--bg);padding:6px" title="${rowCat} ↔ ${colCat}: 0 groups"></td>`;
+      const intensity = Math.log(val + 1) / Math.log(maxVal + 1);
+      return `<td
+        style="background:rgba(239,68,68,${intensity * 0.85});text-align:center;font-size:11px;font-weight:600;cursor:pointer;color:#fff;padding:6px"
+        title="${rowCat} ↔ ${colCat}: ${val} group${val !== 1 ? 's' : ''} — click to filter Objects tab"
+        onclick="heatmapDrillTo('${rowCat}','${colCat}')">${val}</td>`;
     }).join('');
-    const shortName = rowCat.split('_').slice(-2).join('_');
-    return `<tr><td style="font-size:11px;padding:4px 8px;white-space:nowrap;color:var(--text-muted)">${shortName}</td>${cells}</tr>`;
+    return `<tr>
+      <td style="font-size:11px;padding:4px 8px;white-space:nowrap;color:var(--text-muted)" title="${rowCat}">${rowCat.split('_').slice(-2).join('_')}</td>
+      ${cells}
+    </tr>`;
   }).join('');
 
   main().innerHTML = `
     <h2 class="page-title">Duplicate Detection</h2>
     ${tabNav}
     <div class="card" style="padding:16px;overflow-x:auto">
-      <div style="font-weight:600;font-size:13px;margin-bottom:4px">Cross-catalog duplication heatmap</div>
-      <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">Each cell shows the number of duplicate groups spanning both catalogs. Darker = more duplication.</div>
-      ${catalogs.length < 2 ? '<div class="empty-state"><p>Not enough catalogs for a heatmap.</p></div>' : `
-        <table style="border-collapse:collapse;font-size:12px">
-          <thead><tr><th></th>${headerCells}</tr></thead>
-          <tbody>${rows}</tbody>
-        </table>`}
+      <div style="font-weight:600;font-size:13px;margin-bottom:2px">Cross-catalog duplication heatmap</div>
+      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
+        Each cell shows cross-catalog duplicate object groups spanning both catalogs. Darker = more. Click a cell to drill into the Objects tab.
+      </div>
+      ${filterBar}
+      ${catalogs.length < 2
+        ? '<div class="empty-state"><p>No cross-catalog duplicates match the current filters.</p></div>'
+        : `<table style="border-collapse:collapse;font-size:12px">
+             <thead><tr><th></th>${headerCells}</tr></thead>
+             <tbody>${rows}</tbody>
+           </table>`
+      }
     </div>`;
-}
 
+  // ── Wire filter changes ───────────────────────────────────────────────────
+  const onHmChange = () => {
+    state.filters.hideGovernanceViews = document.getElementById('hm-gov')?.checked   ?? f.hideGovernanceViews;
+    state.filters.hidePipelineStages  = document.getElementById('hm-pipe')?.checked  ?? f.hidePipelineStages;
+    state.filters.hideSharedSource    = document.getElementById('hm-shared')?.checked ?? f.hideSharedSource;
+    state.filters.minGroupSize        = parseInt(document.getElementById('hm-size')?.value) || 2;
+    state.heatmapMinGroups            = parseInt(document.getElementById('hm-min')?.value)  || 0;
+    renderHeatmap();
+  };
+  ['hm-gov','hm-pipe','hm-shared'].forEach(id =>
+    document.getElementById(id)?.addEventListener('change', onHmChange)
+  );
+  ['hm-size','hm-min'].forEach(id =>
+    document.getElementById(id)?.addEventListener('input', onHmChange)
+  );
+}
 function renderOwnerSummary() {
   // Build table→owner lookup
   const tableOwner = {};
@@ -771,16 +1017,81 @@ function renderOwnerSummary() {
 
 function buildDupTabNav() {
   return `<div style="display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0">
-    ${['groups','heatmap','owners','schemas','info'].map(t => `
+    ${['schemas','groups','heatmap','owners','dismissed','info'].map(t => `
       <button onclick="state.duplicatesTab='${t}';renderDuplicates()" style="padding:7px 16px;font-size:13px;font-weight:${state.duplicatesTab===t?'600':'400'};border:none;background:none;cursor:pointer;color:${state.duplicatesTab===t?'var(--accent)':'var(--text-muted)'};border-bottom:2px solid ${state.duplicatesTab===t?'var(--accent)':'transparent'};margin-bottom:-1px">
-        ${{groups:'Groups',heatmap:'Heatmap',owners:'Owners',schemas:'Schemas',info:'Info'}[t]}
+        ${{schemas:'Schemas',groups:'Objects',heatmap:'Heatmap',owners:'Owners',dismissed:'Dismissed',info:'Info'}[t]}
       </button>`).join('')}
   </div>`;
 }
 
+function applySchemaFilters(groups) {
+  const f = state.schemasFilters;
+  return groups.filter(g => {
+    // Table similarity range — compare against highest pairwise sim in group
+    const tSim = Math.round(g.max_table_similarity * 100);
+    if (tSim < f.minTableSim || tSim > f.maxTableSim) return false;
+
+    // Catalog prefix — any/all across all catalogs in the group
+    if (f.catalogPrefix) {
+      const prefix = f.catalogPrefix.toLowerCase();
+      const catalogs = g.schemas.map(s => s.split('.')[0].toLowerCase());
+      const matches = catalogs.filter(c => c.includes(prefix)).length;
+      if (f.catalogPrefixMode === 'all' ? matches < catalogs.length : matches === 0)
+        return false;
+    }
+
+    // Minimum table count — at least one schema in the group must meet it
+    if (f.minTables > 0) {
+      const counts = Object.values(g.table_counts || {});
+      if (!counts.some(c => c >= f.minTables)) return false;
+    }
+
+    // Free-text search against any schema full name in the group
+    if (f.search) {
+      const q = f.search.toLowerCase();
+      if (!g.schemas.some(s => s.toLowerCase().includes(q))) return false;
+    }
+
+    if (!f.showDismissed && state.dismissedKeys.has(schemaGroupKey(g)))
+      return false;
+
+    return true;
+  });
+}
+
+function schemaFilterSummary(filtered, total) {
+  const f = state.schemasFilters;
+  const chips = [];
+  if (f.search)          chips.push({ label: `Search: "${f.search}"`,              key: 'search',     val: '' });
+  if (f.minTableSim > 0) chips.push({ label: `Max table sim ≥ ${f.minTableSim}%`,   key: 'minTableSim', val: 0 });
+  if (f.maxTableSim < 100) chips.push({ label: `Max table sim ≤ ${f.maxTableSim}%`, key: 'maxTableSim', val: 100 });
+  if (f.catalogPrefix)   chips.push({ label: `Catalog (${f.catalogPrefixMode}): "${f.catalogPrefix}"`, key: 'catalogPrefix', val: '' });
+  if (f.minTables > 0)   chips.push({ label: `Min tables: ${f.minTables}`,          key: 'minTables',  val: 0 });
+
+  if (!chips.length) return '';
+
+  const chipHtml = chips.map(c =>
+    `<span class="filter-chip" data-schema-filter-key="${c.key}" data-schema-filter-val="${c.val}"
+      style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:11px;background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);cursor:pointer">
+      ${c.label} &times;
+    </span>`
+  ).join('');
+
+  const hidden = total - filtered;
+  return `
+    <div id="schema-filter-summary" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 0;margin-bottom:4px">
+      ${chipHtml}
+      <button id="clear-schema-filters" class="btn btn-outline btn-sm" style="font-size:11px;padding:2px 8px">
+        Clear all
+      </button>
+      ${hidden > 0 ? `<span style="font-size:12px;color:var(--text-muted);margin-left:4px">${hidden} pair${hidden!==1?'s':''} hidden</span>` : ''}
+    </div>`;
+}
+
 async function renderSchemaGroups() {
-  const tabNav  = buildDupTabNav();
+  const tabNav    = buildDupTabNav();
   const threshold = state.schemasThreshold;
+  let _schemaSearchTimer, _schemaSimTimer, _schemaCatTimer, _schemaMinTablesTimer;
 
   // Loading state on first visit (or after refresh)
   if (state.schemaGroups === null) {
@@ -802,57 +1113,158 @@ async function renderSchemaGroups() {
     return;
   }
 
-  const groups = state.schemaGroups;
+  const allGroups      = state.schemaGroups;
+  const filtered       = applySchemaFilters(allGroups);
+  const f              = state.schemasFilters;
 
-  // ── Toolbar ──────────────────────────────────────────────────────────────
-  const toolbar = `
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:16px">
-      <span style="font-size:13px;color:var(--text-muted)">
-        <strong>${groups.length}</strong> schema pair${groups.length !== 1 ? 's' : ''}
-        with &ge;${(threshold * 100).toFixed(0)}% table-name overlap
-      </span>
-      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-muted)">
-        Threshold
-        <input type="number" id="schema-threshold" min="0.1" max="1" step="0.05"
-          value="${threshold}"
-          style="width:60px;padding:3px 6px;font-size:13px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text)"
-          title="Lower = more pairs; press Enter to reload" />
-      </label>
-      <button class="btn btn-outline btn-sm" onclick="state.schemaGroups=null;renderDuplicates()">Refresh</button>
-      <button class="btn btn-outline btn-sm" id="schema-compact-toggle"
-        style="${state.schemasCompact ? 'background:var(--accent-soft);border-color:var(--accent)' : ''}">
-        ${state.schemasCompact ? 'Card view' : 'Compact view'}
-      </button>
+  // ── Filter card ───────────────────────────────────────────────────────────
+  const filterCard = `
+    <div class="card" style="padding:14px 16px;margin-bottom:16px">
+      <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">
+
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label style="font-size:11px;color:var(--text-muted)">Search schemas</label>
+          <input type="text" id="sf-search" value="${f.search}"
+            placeholder="Schema or catalog name…"
+            style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:200px" />
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label style="font-size:11px;color:var(--text-muted)">Catalog contains</label>
+          <div style="display:flex;align-items:center;gap:4px">
+            <select id="sf-catalog-mode" style="font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)">
+              <option value="any" ${f.catalogPrefixMode === 'any' ? 'selected' : ''}>Any</option>
+              <option value="all" ${f.catalogPrefixMode === 'all' ? 'selected' : ''}>All</option>
+            </select>
+            <input type="text" id="sf-catalog" value="${f.catalogPrefix}"
+              placeholder="e.g. gold"
+              style="font-size:13px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text);width:110px" />
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label style="font-size:11px;color:var(--text-muted)">Table sim %</label>
+          <div style="display:flex;align-items:center;gap:4px">
+            <input type="number" id="sf-min-sim" min="0" max="100" value="${f.minTableSim}"
+              style="width:52px;font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)" />
+            <span style="font-size:12px;color:var(--text-muted)">–</span>
+            <input type="number" id="sf-max-sim" min="0" max="100" value="${f.maxTableSim}"
+              style="width:52px;font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)" />
+          </div>
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <label style="font-size:11px;color:var(--text-muted)">Min tables</label>
+          <input type="number" id="sf-min-tables" min="0" value="${f.minTables}"
+            style="width:60px;font-size:13px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--text)" />
+        </div>
+
+        <div style="display:flex;align-items:flex-end;gap:8px;margin-left:auto">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-muted)">
+            Threshold
+            <input type="number" id="schema-threshold" min="0.1" max="1" step="0.05"
+              value="${threshold}"
+              style="width:60px;padding:4px 6px;font-size:13px;border:1px solid var(--border);border-radius:4px;background:var(--bg-secondary);color:var(--text)"
+              title="Re-fetches from server at new threshold" />
+          </label>
+          <button class="btn btn-outline btn-sm" onclick="state.schemaGroups=null;renderDuplicates()">Refresh</button>
+          <button class="btn btn-outline btn-sm" id="schema-compact-toggle"
+            style="${state.schemasCompact ? 'background:var(--accent-soft);border-color:var(--accent)' : ''}">
+            ${state.schemasCompact ? 'Card view' : 'Compact view'}
+          </button>
+        </div>
+
+      </div>
+      ${schemaFilterSummary(filtered.length, allGroups.length)}
+    </div>`;
+
+  // ── Results count ─────────────────────────────────────────────────────────
+  const countLine = `
+    <div style="font-size:12px;color:var(--text-muted);margin-bottom:12px">
+      Showing <strong>${filtered.length}</strong> of <strong>${allGroups.length}</strong>
+      schema group${allGroups.length !== 1 ? 's' : ''} with
+      &ge;${(threshold * 100).toFixed(0)}% table-name overlap
     </div>`;
 
   // ── Render ────────────────────────────────────────────────────────────────
   main().innerHTML = `
     <h2 class="page-title">Duplicate Detection</h2>
     ${tabNav}
-    ${toolbar}
+    ${filterCard}
+    ${countLine}
     <div id="schema-groups-list">
-      ${groups.length
-        ? (state.schemasCompact ? renderSchemaCompact(groups) : groups.map(renderSchemaCard).join(''))
-        : '<div class="empty-state"><h3>No schema duplicates found</h3><p>Try lowering the threshold.</p></div>'
+      ${filtered.length
+        ? (state.schemasCompact ? renderSchemaCompact(filtered) : filtered.map(renderSchemaCard).join(''))
+        : '<div class="empty-state"><h3>No schema groups match the current filters</h3><p>Try clearing some filters or lowering the threshold.</p></div>'
       }
     </div>`;
 
   // ── Event handlers ────────────────────────────────────────────────────────
-  const compactBtn = document.getElementById('schema-compact-toggle');
-  if (compactBtn) compactBtn.onclick = () => {
+  function onSchemaFilterChange() {
+    state.schemasFilters.search       = document.getElementById('sf-search')?.value.trim() || '';
+    state.schemasFilters.catalogPrefix     = document.getElementById('sf-catalog')?.value.trim() || '';
+    state.schemasFilters.catalogPrefixMode  = document.getElementById('sf-catalog-mode')?.value || 'any';
+    state.schemasFilters.showDismissed      = document.getElementById('sf-show-dismissed')?.checked || false;
+    state.schemasFilters.minTableSim  = parseInt(document.getElementById('sf-min-sim')?.value) || 0;
+    state.schemasFilters.maxTableSim  = parseInt(document.getElementById('sf-max-sim')?.value) || 100;
+    state.schemasFilters.minTables    = parseInt(document.getElementById('sf-min-tables')?.value) || 0;
+    renderSchemaGroups();
+  }
+
+  // Debounced text inputs
+  document.getElementById('sf-search')?.addEventListener('input', () => {
+    clearTimeout(_schemaSearchTimer);
+    _schemaSearchTimer = setTimeout(onSchemaFilterChange, 400);
+  });
+  document.getElementById('sf-catalog-mode')?.addEventListener('change', onSchemaFilterChange);
+  document.getElementById('sf-show-dismissed')?.addEventListener('change', onSchemaFilterChange);
+  document.getElementById('sf-catalog')?.addEventListener('input', () => {
+    clearTimeout(_schemaCatTimer);
+    _schemaCatTimer = setTimeout(onSchemaFilterChange, 400);
+  });
+  ['sf-min-sim','sf-max-sim'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', () => {
+      clearTimeout(_schemaSimTimer);
+      _schemaSimTimer = setTimeout(onSchemaFilterChange, 400);
+    });
+  });
+  document.getElementById('sf-min-tables')?.addEventListener('input', () => {
+    clearTimeout(_schemaMinTablesTimer);
+    _schemaMinTablesTimer = setTimeout(onSchemaFilterChange, 400);
+  });
+
+  // Chip click — reset individual filter to default
+  document.getElementById('schema-filter-summary')?.addEventListener('click', e => {
+    const chip = e.target.closest('[data-schema-filter-key]');
+    if (!chip) return;
+    const key = chip.dataset.schemaFilterKey;
+    const val = chip.dataset.schemaFilterVal;
+    state.schemasFilters[key] = isNaN(Number(val)) ? val : Number(val);
+    if (key === 'catalogPrefix') state.schemasFilters.catalogPrefixMode = 'any';
+    renderSchemaGroups();
+  });
+
+  // Clear all filters
+  document.getElementById('clear-schema-filters')?.addEventListener('click', () => {
+    state.schemasFilters = { search: '', minTableSim: 0, maxTableSim: 100, catalogPrefix: '', catalogPrefixMode: 'any', minTables: 0, showDismissed: false };
+    renderSchemaGroups();
+  });
+
+  // Compact toggle
+  document.getElementById('schema-compact-toggle')?.addEventListener('click', () => {
     state.schemasCompact = !state.schemasCompact;
     renderSchemaGroups();
-  };
+  });
 
-  const threshInput = document.getElementById('schema-threshold');
-  if (threshInput) threshInput.onchange = () => {
-    const v = parseFloat(threshInput.value);
+  // Threshold reload
+  document.getElementById('schema-threshold')?.addEventListener('change', () => {
+    const v = parseFloat(document.getElementById('schema-threshold').value);
     if (!isNaN(v) && v >= 0.1 && v <= 1.0) {
       state.schemasThreshold = v;
       state.schemaGroups = null;
       renderDuplicates();
     }
-  };
+  });
 }
 
 
@@ -865,205 +1277,140 @@ function _catalogBadge(fullSchema) {
 }
 
 
+function drillToGroups(schemaName) {
+  // Pre-filter the Groups tab to show duplicates involving tables from this schema
+  state.filters.schemaPrefix     = schemaName;
+  state.filters.schemaPrefixMode = 'any';
+  state.duplicatesTab            = 'groups';
+  renderDuplicates();
+}
+
 function renderSchemaCard(g) {
-  const catA    = g.schema_a.split('.')[0];
-  const nameA   = g.schema_a.split('.').slice(1).join('.');
-  const catB    = g.schema_b.split('.')[0];
-  const nameB   = g.schema_b.split('.').slice(1).join('.');
-  const sameCat = catA === catB;
+  const maxSim   = (g.max_table_similarity * 100).toFixed(0);
+  const avgSim   = (g.avg_table_similarity * 100).toFixed(0);
+  const maxColSim = (g.max_column_similarity * 100).toFixed(0);
+  const simColor = similarityColor(g.max_table_similarity);
+  const label    = g.label || g.shared_tokens?.slice(0,3).join(' · ') || g.schemas[0]?.split('.')[1] || 'Schema group';
+  const sgKey    = schemaGroupKey(g);
+  const isDismissed = state.dismissedKeys.has(sgKey);
+  const dismissRecord = state.dismissedKeys.get(sgKey);
 
-  const tableSim  = (g.table_similarity  * 100).toFixed(0);
-  const colSim    = (g.column_similarity * 100).toFixed(0);
-  const tSimColor = similarityColor(g.table_similarity);
-  const cSimColor = similarityColor(g.column_similarity);
+  const schemaChips = g.schemas.map(s => {
+    const cat  = s.split('.')[0];
+    const name = s.split('.').slice(1).join('.');
+    return `<span class="dup-table-tag" style="display:inline-flex;align-items:center;gap:5px;margin:2px">
+      ${_catalogBadge(s)}
+      <span style="font-size:12px">${name}</span>
+    </span>`;
+  }).join('');
 
-  const sharedChips = g.shared_tokens.map(t =>
+  const sharedChips = (g.shared_tokens || []).map(t =>
     `<span class="tag tag-accent" style="font-size:11px">${t}</span>`
   ).join(' ');
 
-  const onlyAChips = (g.only_a || []).map(t =>
-    `<span class="tag" style="font-size:11px;background:var(--accent-soft)">${t}</span>`
-  ).join(' ');
-  const onlyBChips = (g.only_b || []).map(t =>
-    `<span class="tag" style="font-size:11px;background:var(--bg-secondary)">${t}</span>`
-  ).join(' ');
+  const pairsHtml = (g.pairs || []).map(p => {
+    const nameA = p.schema_a.split('.').slice(1).join('.');
+    const nameB = p.schema_b.split('.').slice(1).join('.');
+    return `<tr>
+      <td title="${p.schema_a}">${_catalogBadge(p.schema_a)} ${nameA}</td>
+      <td title="${p.schema_b}">${_catalogBadge(p.schema_b)} ${nameB}</td>
+      <td style="text-align:center;font-weight:600;color:${similarityColor(p.table_similarity)}">${(p.table_similarity*100).toFixed(0)}%</td>
+      <td style="text-align:center">${(p.column_similarity*100).toFixed(0)}%</td>
+    </tr>`;
+  }).join('');
 
-  const hasDiff = (g.only_a?.length || 0) + (g.only_b?.length || 0) > 0;
+  const drillName = g.schemas[0]?.split('.').slice(1).join('.') || '';
 
   return `
     <div class="dup-group" style="margin-bottom:14px">
       <div class="dup-group-header" style="align-items:flex-start">
-        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-          <span style="display:flex;align-items:center;gap:6px">
-            ${_catalogBadge(g.schema_a)}
-            <strong style="font-size:13px">${nameA}</strong>
-          </span>
-          <span style="color:var(--text-muted);font-size:13px">\u2194</span>
-          <span style="display:flex;align-items:center;gap:6px">
-            ${_catalogBadge(g.schema_b)}
-            <strong style="font-size:13px">${nameB}</strong>
-          </span>
-          ${sameCat ? '<span class="tag" style="font-size:10px;opacity:0.7">same catalog</span>' : ''}
+        <div>
+          <div style="font-weight:600;font-size:14px;color:var(--text);margin-bottom:3px">${label}</div>
+          <div style="font-size:12px;color:var(--text-muted)">
+            <strong>${g.schemas.length}</strong> schema${g.schemas.length !== 1 ? 's' : ''}
+            &nbsp;·&nbsp; <span style="color:${simColor};font-weight:600">${maxSim}%</span> max table sim
+            &nbsp;·&nbsp; ${avgSim}% avg &nbsp;·&nbsp; ${maxColSim}% max col sim
+          </div>
         </div>
-        <div style="display:flex;gap:14px;align-items:center;flex-shrink:0">
-          <span style="font-size:12px;color:var(--text-muted)">
-            <span style="color:${tSimColor};font-weight:600">${tableSim}%</span> tables
-          </span>
-          <span style="font-size:12px;color:var(--text-muted)">
-            <span style="color:${cSimColor};font-weight:600">${colSim}%</span> columns
-          </span>
-        </div>
+        ${isDismissed
+          ? `<button class='btn btn-outline btn-sm schema-undismiss-btn' data-sgkey='${sgKey}' style='font-size:11px;padding:2px 8px;color:var(--text-muted)' title='Restore this group'>Restore</button>`
+          : `<button class='btn btn-outline btn-sm schema-dismiss-btn' data-sgkey='${sgKey}' style='font-size:11px;padding:2px 8px;opacity:0.6' title='Dismiss this group'>Dismiss</button>`
+        }
       </div>
+      ${isDismissed ? `<div style='font-size:11px;color:var(--text-muted);margin-bottom:6px;font-style:italic'>Dismissed: ${dismissRecord?.rationale || ''}</div>` : ''}
 
       <div class="similarity-bar" style="margin:8px 0">
-        <div class="similarity-bar-fill" style="width:${tableSim}%;background:${tSimColor}"></div>
+        <div class="similarity-bar-fill" style="width:${maxSim}%;background:${simColor}"></div>
       </div>
 
-      <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">
-        ${g.table_count_a} tables in <strong>${nameA}</strong>
-        &nbsp;&nbsp;\u2194&nbsp;&nbsp;
-        ${g.table_count_b} tables in <strong>${nameB}</strong>
+      <div class="dup-tables-list" style="margin-bottom:10px">
+        ${schemaChips}
       </div>
 
       ${sharedChips ? `
         <div style="margin-bottom:8px">
-          <span style="font-size:11px;color:var(--text-muted);margin-right:6px">Shared:</span>
+          <span style="font-size:11px;color:var(--text-muted);margin-right:6px">Shared tokens:</span>
           ${sharedChips}
         </div>` : ''}
 
-      ${hasDiff ? `
+      ${pairsHtml ? `
         <details style="margin-top:6px">
           <summary style="cursor:pointer;font-size:12px;color:var(--text-muted);user-select:none;padding:2px 0">
-            Differences (${(g.only_a?.length||0) + (g.only_b?.length||0)} unique tokens)
+            Show ${g.pairs.length} pair${g.pairs.length !== 1 ? 's' : ''}
           </summary>
-          <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
-            ${onlyAChips ? `<div><span style="font-size:11px;color:var(--text-muted);margin-right:6px">Only in ${nameA}:</span>${onlyAChips}</div>` : ''}
-            ${onlyBChips ? `<div><span style="font-size:11px;color:var(--text-muted);margin-right:6px">Only in ${nameB}:</span>${onlyBChips}</div>` : ''}
-          </div>
+          <table class="data-table" style="margin-top:8px;font-size:12px">
+            <thead><tr><th>Schema A</th><th>Schema B</th><th>Table sim</th><th>Col sim</th></tr></thead>
+            <tbody>${pairsHtml}</tbody>
+          </table>
         </details>` : ''}
+
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;justify-content:flex-end">
+        <button class="btn btn-outline btn-sm" onclick="drillToGroups('${drillName}')">
+          View table groups &rarr;
+        </button>
+      </div>
     </div>`;
 }
 
 
 function renderSchemaCompact(groups) {
   const rows = groups.map(g => {
-    const nameA  = g.schema_a.split('.').slice(1).join('.');
-    const nameB  = g.schema_b.split('.').slice(1).join('.');
-    const tColor = similarityColor(g.table_similarity);
-    const cColor = similarityColor(g.column_similarity);
+    const simColor = similarityColor(g.max_table_similarity);
+    const colColor = similarityColor(g.max_column_similarity);
+    const drillName = g.schemas[0]?.split('.').slice(1).join('.') || '';
+
+    // Show first 3 schemas with catalog badges, then "+N more"
+    const shown = g.schemas.slice(0, 3).map(s =>
+      `${_catalogBadge(s)} <span style="font-size:11px">${s.split('.').slice(1).join('.')}</span>`
+    ).join(' ');
+    const extra = g.schemas.length > 3
+      ? ` <span style="font-size:11px;color:var(--text-muted)">+${g.schemas.length - 3} more</span>`
+      : '';
+
+    const sharedPreview = (g.shared_tokens || []).slice(0, 4).map(t =>
+      `<span class="tag tag-accent" style="font-size:10px">${t}</span>`
+    ).join(' ');
+
     return `<tr>
-      <td title="${g.schema_a}">${_catalogBadge(g.schema_a)} <span style="font-size:12px">${nameA}</span></td>
-      <td title="${g.schema_b}">${_catalogBadge(g.schema_b)} <span style="font-size:12px">${nameB}</span></td>
-      <td style="text-align:center;font-weight:600;color:${tColor}">${(g.table_similarity*100).toFixed(0)}%</td>
-      <td style="text-align:center;font-weight:600;color:${cColor}">${(g.column_similarity*100).toFixed(0)}%</td>
-      <td style="text-align:center;color:var(--text-muted)">${g.table_count_a} / ${g.table_count_b}</td>
-      <td style="font-size:11px">${(g.shared_tokens||[]).slice(0,5).map(t=>`<span class="tag tag-accent" style="font-size:10px">${t}</span>`).join(' ')}${g.shared_tokens?.length>5?` <span style="color:var(--text-muted)">+${g.shared_tokens.length-5}</span>`:''}</td>
+      <td style="font-size:11px">${shown}${extra}</td>
+      <td style="text-align:center">${g.schemas.length}</td>
+      <td style="text-align:center;font-weight:600;color:${simColor}">${(g.max_table_similarity*100).toFixed(0)}%</td>
+      <td style="text-align:center;font-weight:600;color:${colColor}">${(g.max_column_similarity*100).toFixed(0)}%</td>
+      <td style="font-size:11px">${sharedPreview}</td>
+      <td><button class="btn btn-outline btn-sm" style="font-size:11px;padding:2px 7px"
+        onclick="drillToGroups('${drillName}')">&rarr;</button></td>
     </tr>`;
   }).join('');
 
   return `
     <table class="data-table">
       <thead><tr>
-        <th>Schema A</th><th>Schema B</th>
-        <th>Table sim</th><th>Col sim</th>
-        <th>Tables A/B</th><th>Shared tokens</th>
+        <th>Schemas</th><th>Count</th>
+        <th>Max table sim</th><th>Max col sim</th>
+        <th>Shared tokens</th><th></th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
-}
-
-
-function renderDupInfo() {
-  const tabNav = buildDupTabNav();
-  main().innerHTML = `
-    <h2 class="page-title">Duplicate Detection</h2>
-    ${tabNav}
-    <div style="max-width:860px;display:flex;flex-direction:column;gap:16px">
-
-      <div class="card" style="padding:18px 20px">
-        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Groups</div>
-        <p style="font-size:13px;color:var(--text-muted);line-height:1.6;margin:0">
-          The main view. Each card represents a cluster of tables whose column structures are
-          similar enough to be potential duplicates. Cards show the tables in the group, the
-          <strong>gold-standard</strong> recommendation (&#11088; star), a similarity score,
-          lineage information where available, and tags that explain why the group was flagged.
-        </p>
-        <div style="margin-top:10px;display:flex;flex-direction:column;gap:6px;font-size:12px">
-          <div><strong>Composite score</strong> — weighted average of four signals:
-            column overlap (40%), type compatibility (25%), name similarity (15%), lineage score (20%).
-            Groups only appear if at least one pair exceeds the detection threshold (default 0.5).</div>
-          <div><strong>&#11088; Gold standard</strong> — the table the engine recommends keeping.
-            Scored on consumer count, medallion tier, table type (TABLE &gt; VIEW &gt; EXTERNAL),
-            and upstream lineage depth. Higher consumer count and gold/silver tier score highest.</div>
-          <div><strong>&#9851;&#65039; Dead duplicate badge</strong> — a non-gold table with zero
-            downstream consumers. Nothing reads it, making it the safest candidate to deprecate.
-            Use the <em>Safe to deprecate only</em> filter to surface these groups exclusively.</div>
-          <div><strong>&#128279; Common source</strong> — the closest ancestor shared by all tables
-            in the group, with the hop range. A group where all tables trace back to the same
-            bronze source 2–3 hops away is almost certainly a pipeline-stage group rather than
-            an actionable duplicate.</div>
-          <div><strong>Tags</strong> — <em>pipeline_stage</em>: tables form a direct lineage chain
-            or span medallion tiers. <em>governance_view</em>: a VIEW whose columns are a subset
-            of a paired TABLE. <em>shared_source</em>: all tables share a common immediate upstream.
-            These groups are typically informational rather than requiring cleanup.</div>
-        </div>
-      </div>
-
-      <div class="card" style="padding:18px 20px">
-        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Heatmap</div>
-        <p style="font-size:13px;color:var(--text-muted);line-height:1.6;margin:0">
-          A catalog &times; catalog matrix showing where cross-catalog duplication is concentrated.
-          Each cell shows the number of duplicate groups that span both catalogs — darker red means
-          more duplication. The diagonal is empty (same-catalog groups are not shown). Use this
-          to identify which catalog boundaries have the highest redundancy at a glance, without
-          reading individual group cards.
-        </p>
-      </div>
-
-      <div class="card" style="padding:18px 20px">
-        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Owners</div>
-        <p style="font-size:13px;color:var(--text-muted);line-height:1.6;margin:0">
-          A breakdown of cross-catalog duplication by data owner and catalog. For each
-          (owner, catalog) pair, the table shows how many duplicate groups involve their tables
-          and how many distinct tables of theirs are caught in cross-catalog groups. Sorted by
-          group count descending. Use this to prioritise remediation conversations — the top
-          rows identify which owners have the most to gain from clean-up.
-        </p>
-      </div>
-
-      <div class="card" style="padding:18px 20px">
-        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Schemas</div>
-        <p style="font-size:13px;color:var(--text-muted);line-height:1.6;margin:0">
-          Pairs of schemas (across different catalogs) with structurally similar table sets.
-          Similarity is measured as Jaccard overlap on normalised table-name tokens — a score of
-          70% or above means the two schemas share at least 70% of their distinctive table name
-          vocabulary. A high score often indicates copy-paste schema proliferation: the same
-          logical dataset reproduced in multiple catalogs through environment promotion or
-          ad-hoc ingestion. Results load on demand; use the <em>Refresh</em> button to recompute.
-        </p>
-        <div style="margin-top:10px;font-size:12px;display:flex;flex-direction:column;gap:4px">
-          <div><strong>Table similarity</strong> — Jaccard on normalised table name tokens (stop words like <em>raw</em>, <em>dim</em>, <em>fact</em> removed).</div>
-          <div><strong>Column similarity</strong> — Jaccard on canonical column names across all tables in each schema.</div>
-          <div><strong>Shared tokens</strong> — the name tokens the two schemas have in common, giving a quick sense of which logical entities overlap.</div>
-        </div>
-      </div>
-
-      <div class="card" style="padding:18px 20px">
-        <div style="font-weight:700;font-size:14px;margin-bottom:10px">Filters &amp; controls (Groups tab)</div>
-        <div style="font-size:12px;color:var(--text-muted);display:flex;flex-direction:column;gap:5px">
-          <div><strong>Min group size</strong> — hide pairs (size 2) and surface only clusters of 3+ tables, which are higher-confidence duplicates.</div>
-          <div><strong>Cross-catalog only</strong> — show only groups spanning 2+ catalogs. These are almost always more architecturally significant than same-catalog groups.</div>
-          <div><strong>Score range</strong> — isolate high-confidence duplicates (&gt;80%) from borderline ones (50–65%) without re-running detection.</div>
-          <div><strong>Schema prefix / mode</strong> — filter by the schema segment of table names. <em>Any</em> = at least one table matches; <em>All</em> = every table in the group matches.</div>
-          <div><strong>Table type</strong> — show only groups containing TABLE, VIEW, or EXTERNAL tables.</div>
-          <div><strong>Owner</strong> — filter to groups where at least one table belongs to the selected owner.</div>
-          <div><strong>Safe to deprecate only</strong> — show only groups where at least one non-gold table has zero downstream consumers.</div>
-          <div><strong>Dismiss</strong> — hide a group from the default view. Dismissed groups are stored in browser localStorage and persist across sessions. Toggle <em>Show dismissed</em> to review them.</div>
-          <div><strong>Compact view</strong> — switch from cards to a dense single-row-per-group table for scanning large numbers of groups quickly.</div>
-        </div>
-      </div>
-
-    </div>`;
 }
 
 
@@ -1084,13 +1431,13 @@ function renderDupInfo() {
     ${tabNav}
 
     ${section('How duplicate groups are detected',
-      `The detection engine compares every pair of tables that share at least one name token (e.g. two tables both containing the word <em>pupil</em>) across different schemas or catalogs.
+      `The detection engine compares every pair of tables that share at least one name token across different schemas or catalogs.
        Each pair receives a <strong>composite similarity score</strong> from four signals:
        <table class="data-table" style="margin-top:10px;font-size:12px">
          <thead><tr><th>Signal</th><th>Weight</th><th>What it measures</th></tr></thead>
          <tbody>
            <tr><td>Column overlap</td><td style="text-align:center">40%</td><td>Jaccard similarity of canonical column names (synonyms resolved, prefixes stripped)</td></tr>
-           <tr><td>Type compatibility</td><td style="text-align:center">25%</td><td>Fraction of shared columns whose types are compatible (e.g. INT and BIGINT both count)</td></tr>
+           <tr><td>Type compatibility</td><td style="text-align:center">25%</td><td>Fraction of shared columns whose types are compatible</td></tr>
            <tr><td>Name similarity</td><td style="text-align:center">15%</td><td>Token-level Jaccard on the table name, ignoring common prefixes like <code>dim_</code>, <code>fact_</code></td></tr>
            <tr><td>Lineage score</td><td style="text-align:center">20%</td><td>Weighted shared-ancestor score — higher when tables trace back to the same source through shallow paths</td></tr>
          </tbody>
@@ -1098,60 +1445,73 @@ function renderDupInfo() {
        <div style="margin-top:10px">Groups with a maximum pair score below the detection threshold (default <strong>0.5</strong>) are excluded entirely.</div>`
     )}
 
-    ${section('Groups tab',
-      `The main view. Each card represents a cluster of tables the engine considers likely duplicates.
+    ${section('Objects tab',
+      `The main view. Each card is a cluster of tables the engine considers likely duplicates.
        <ul style="margin:8px 0 0 16px;padding:0">
-         <li style="margin-bottom:6px">${badge('⭐ Gold standard', '#f59e0b')} — The table the engine recommends keeping. Scored on: downstream consumer count, catalog tier (gold &gt; silver &gt; bronze &gt; copper), table type (TABLE &gt; VIEW &gt; EXTERNAL), and lineage depth.</li>
-         <li style="margin-bottom:6px">${badge('♻️ Zero consumers', '#10b981')} — A non-gold table with no downstream consumers in the last 90 days. Safe to deprecate — nothing reads it. Use the <strong>"Safe to deprecate only"</strong> filter to find all such groups at once.</li>
-         <li style="margin-bottom:6px">${badge('🔗 Common source', '#6366f1')} — The closest ancestor shared by all tables in the group, and the hop count from it to each member. High lineage coverage (green) means most tables have lineage data.</li>
-         <li style="margin-bottom:6px"><strong>Tags</strong> — <code>pipeline_stage</code> means a direct lineage edge exists between group members (expected duplication). <code>governance_view</code> means one member is a VIEW whose columns are a subset of a paired TABLE. <code>shared_source</code> means all members share a common direct parent.</li>
+         <li style="margin-bottom:6px">${badge('⭐ Gold standard', '#f59e0b')} — The table the engine recommends keeping. Scored on consumer count, catalog tier (gold &gt; silver &gt; bronze &gt; copper), table type (TABLE &gt; VIEW &gt; EXTERNAL), and lineage depth.</li>
+         <li style="margin-bottom:6px">${badge('♻️ Zero consumers', '#10b981')} — A non-gold table with no downstream consumers. Safe to deprecate. Use <strong>"Safe to deprecate only"</strong> to surface all such groups.</li>
+         <li style="margin-bottom:6px">${badge('🔗 Common source', '#6366f1')} — Closest ancestor shared by all tables, with hop count from it to each member.</li>
+         <li style="margin-bottom:6px"><strong>Tags</strong> — <code>pipeline_stage</code>: direct lineage edge between members. <code>governance_view</code>: one member is a VIEW whose columns are a subset of a paired TABLE. <code>shared_source</code>: all members share a common direct parent.</li>
          <li>Expand the <strong>pairs breakdown</strong> to see per-pair scores for each similarity signal.</li>
        </ul>`
     )}
 
-    ${section('Heatmap tab',
-      `A catalog × catalog matrix. Each cell shows how many duplicate groups span both catalogs.
-       Darker red means more cross-catalog duplication between that pair.
+    ${section('Schemas tab',
+      `Groups of schemas across different catalogs with structurally similar table sets.
+       Uses union-find clustering on pairwise Jaccard similarity of normalised table-name tokens — so twelve annual schemas that are all mutually similar appear as one group rather than hundreds of pairs.
        <ul style="margin:8px 0 0 16px;padding:0">
-         <li style="margin-bottom:4px">Use this to identify which catalog boundaries have the most redundancy — e.g. a migration from a copper catalog to a gold one that was never fully cleaned up.</li>
+         <li style="margin-bottom:4px"><strong>Group label</strong> — derived from the tokens shared by all schemas in the group (e.g. <code>ilr · named</code>).</li>
+         <li style="margin-bottom:4px"><strong>Table similarity</strong> — Jaccard on normalised table name tokens; default threshold <strong>70%</strong>.</li>
+         <li style="margin-bottom:4px"><strong>Column similarity</strong> — Jaccard on canonical column names pooled across each schema.</li>
+         <li style="margin-bottom:4px"><strong>Shared tokens</strong> — name tokens common to every schema in the group.</li>
+         <li>Use <strong>View table groups →</strong> on any schema card to jump to the Objects tab filtered to that schema name.</li>
+       </ul>`
+    )}
+
+    ${section('Dismissed tab',
+      `A permanent record of all groups you have chosen to hide, separated by type (Schema groups and Object groups).
+       <ul style="margin:8px 0 0 16px;padding:0">
+         <li style="margin-bottom:4px"><strong>Dismissing</strong> — click <strong>Dismiss</strong> on any group card. A modal requires a rationale before the group is hidden. The reason is stored permanently in the Unity Catalog cache database and survives cache invalidation and rescans.</li>
+         <li style="margin-bottom:4px"><strong>Restoring</strong> — click <strong>Restore</strong> in the Dismissed tab, or toggle <em>Show dismissed</em> on the Objects or Schemas tab to reveal dismissed groups inline and restore from there.</li>
+         <li style="margin-bottom:4px"><strong>Persistence</strong> — dismissal keys are based on the sorted list of tables or schemas in the group, not on any internal scan ID. They survive rescans as long as the same objects are detected together.</li>
+         <li>Intended for groups that have been reviewed and confirmed as non-actionable — e.g. known migration artefacts, intentional copies, or expected pipeline-stage duplication.</li>
+       </ul>`
+    )}
+
+    ${section('Heatmap tab',
+      `A catalog × catalog matrix. Each cell shows how many duplicate object groups span both catalogs.
+       Darker red means more cross-catalog duplication.
+       <ul style="margin:8px 0 0 16px;padding:0">
+         <li style="margin-bottom:4px">Identifies which catalog boundaries have the most redundancy — e.g. a migration that was never fully cleaned up.</li>
          <li>Hover any cell for the exact count. Only cross-catalog groups are counted; same-catalog pairs appear on the diagonal (left empty).</li>
        </ul>`
     )}
 
     ${section('Owners tab',
-      `A breakdown of cross-catalog duplication by owner and catalog. Shows how many duplicate groups and distinct tables each owner has across catalog boundaries.
+      `Breakdown of cross-catalog duplication by owner and catalog. Shows how many duplicate groups and distinct tables each owner has across catalog boundaries.
        <ul style="margin:8px 0 0 16px;padding:0">
-         <li style="margin-bottom:4px">Sort by <strong>Dup groups</strong> to find the owners with the most cross-catalog redundancy — these are the highest-priority remediation conversations.</li>
-         <li>Only cross-catalog groups (spanning 2+ catalogs) are counted here. Within-catalog duplication is excluded.</li>
+         <li style="margin-bottom:4px">Sort by <strong>Dup groups</strong> to find owners with the most cross-catalog redundancy — the highest-priority remediation conversations.</li>
+         <li>Only cross-catalog groups (spanning 2+ catalogs) are counted here.</li>
        </ul>`
     )}
 
-    ${section('Schemas tab',
-      `Pairs of schemas across different catalogs with similar table structure, detected by comparing normalised table-name token sets using Jaccard similarity.
-       <ul style="margin:8px 0 0 16px;padding:0">
-         <li style="margin-bottom:4px"><strong>Table similarity</strong> — fraction of table name tokens shared between the two schemas (≥70% to appear here by default).</li>
-         <li style="margin-bottom:4px"><strong>Column similarity</strong> — fraction of canonical column names shared across all tables in both schemas. A high column sim alongside a high table sim is strong evidence of copy-paste schema proliferation.</li>
-         <li style="margin-bottom:4px"><strong>Shared tokens</strong> — the table name tokens both schemas have in common. Useful for understanding what the schemas represent.</li>
-         <li>Use the <strong>Refresh</strong> button to re-run detection. Lower the threshold in the URL (<code>?threshold=0.5</code>) to surface more pairs.</li>
-       </ul>`
-    )}
-
-    ${section('Filters reference',
+    ${section('Filters reference (Objects tab)',
       `<table class="data-table" style="font-size:12px">
          <thead><tr><th>Filter</th><th>What it does</th></tr></thead>
          <tbody>
-           <tr><td>Hide governance views</td><td>Hides 2-table groups where a VIEW's columns are a subset of a paired TABLE — expected by design</td></tr>
+           <tr><td>Hide governance views</td><td>Hides 2-table groups where a VIEW's columns are a subset of a paired TABLE</td></tr>
            <tr><td>Hide pipeline stages</td><td>Hides groups where a direct lineage edge exists between members, or all catalogs follow the medallion tier pattern</td></tr>
            <tr><td>Hide shared-source groups</td><td>Hides groups where every member shares the same direct upstream parent</td></tr>
-           <tr><td>Cross-catalog only</td><td>Shows only groups that span at least two different catalogs</td></tr>
-           <tr><td>Safe to deprecate only</td><td>Shows only groups that contain at least one non-gold table with zero consumers</td></tr>
-           <tr><td>Min group size</td><td>Excludes groups smaller than N tables — raising this from 2 to 3 removes the noisiest pairs</td></tr>
+           <tr><td>Cross-catalog only</td><td>Shows only groups spanning at least two different catalogs</td></tr>
+           <tr><td>Safe to deprecate only</td><td>Shows only groups containing at least one non-gold table with zero consumers</td></tr>
+           <tr><td>Min group size</td><td>Excludes groups smaller than N tables — raising from 2 to 3 removes the noisiest pairs</td></tr>
            <tr><td>Score range</td><td>Filters on the maximum composite score across all pairs in the group</td></tr>
-           <tr><td>Catalog prefix</td><td>Any mode: at least one table's catalog matches. All mode: every table's catalog matches</td></tr>
-           <tr><td>Schema prefix</td><td>Same as catalog prefix but matches the schema segment (<code>catalog.schema.table</code>)</td></tr>
+           <tr><td>Catalog / schema prefix</td><td>Any mode: at least one table matches. All mode: every table matches</td></tr>
            <tr><td>Table type</td><td>Shows only groups containing at least one table of the selected type(s)</td></tr>
-           <tr><td>Owner</td><td>Shows only groups where at least one table is owned by the selected principal</td></tr>
+           <tr><td>Owner</td><td>Shows only groups where at least one table belongs to the selected principal</td></tr>
            <tr><td>Search</td><td>Free-text match against table names and group label (400 ms debounce)</td></tr>
+           <tr><td>Show dismissed</td><td>Reveals dismissed groups inline with a Restore button on each card</td></tr>
+           <tr><td>Compact view</td><td>Switches from cards to a dense single-row-per-group table for scanning large result sets</td></tr>
          </tbody>
        </table>`
     )}
@@ -1175,13 +1535,14 @@ async function renderDuplicates() {
   if (state.duplicatesTab === 'heatmap') { renderHeatmap(); return; }
   if (state.duplicatesTab === 'owners')  { renderOwnerSummary(); return; }
   if (state.duplicatesTab === 'schemas') { renderSchemaGroups(); return; }
+  if (state.duplicatesTab === 'dismissed') { renderDismissedContent(); return; }
   if (state.duplicatesTab === 'info')    { renderDupInfo(); return; }
 
   const tabNav = `
     <div style="display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0">
-      ${['groups','heatmap','owners','schemas','info'].map(t => `
+      ${['schemas','groups','heatmap','owners','dismissed','info'].map(t => `
         <button onclick="state.duplicatesTab='${t}';renderDuplicates()" style="padding:7px 16px;font-size:13px;font-weight:${state.duplicatesTab===t?'600':'400'};border:none;background:none;cursor:pointer;color:${state.duplicatesTab===t?'var(--accent)':'var(--text-muted)'};border-bottom:2px solid ${state.duplicatesTab===t?'var(--accent)':'transparent'};margin-bottom:-1px">
-          ${{groups:'Groups',heatmap:'Heatmap',owners:'Owners',schemas:'Schemas',info:'Info'}[t]}
+          ${{schemas:'Schemas',groups:'Objects',heatmap:'Heatmap',owners:'Owners',dismissed:'Dismissed',info:'Info'}[t]}
         </button>`).join('')}
     </div>`;
 
@@ -1500,7 +1861,10 @@ function renderDupGroupCard(g) {
         <span class="dup-group-title">${g.label} \u2014 ${g.tables.length} tables${crossCatalog ? ` across ${catalogSet.size} catalogs` : ''}</span>
         <div style="display:flex;align-items:center;gap:10px">
           <span class="similarity-score" style="color:${similarityColor(maxScore)}">${(maxScore * 100).toFixed(0)}% max similarity</span>
-          <button class="btn btn-outline btn-sm dismiss-btn" data-key="${groupKey(g)}" style="font-size:11px;padding:2px 8px;opacity:0.6" title="Dismiss this group">Dismiss</button>
+          ${state.dismissedKeys.has(groupKey(g))
+            ? `<button class="btn btn-outline btn-sm undismiss-btn" data-key="${groupKey(g)}" style="font-size:11px;padding:2px 8px;color:var(--text-muted)" title="Restore this group">Restore</button>`
+            : `<button class="btn btn-outline btn-sm dismiss-btn" data-key="${groupKey(g)}" style="font-size:11px;padding:2px 8px;opacity:0.6" title="Dismiss this group">Dismiss</button>`
+          }
         </div>
       </div>
       <div class="similarity-bar"><div class="similarity-bar-fill" style="width:${maxScore * 100}%;background:${similarityColor(maxScore)}"></div></div>
@@ -1557,14 +1921,41 @@ function renderDupGroupCard(g) {
   `;
 }
 
-document.addEventListener('click', (e) => {
+document.addEventListener('click', async (e) => {
   const dismissBtn = e.target.closest('.dismiss-btn');
   if (dismissBtn) {
     const key = dismissBtn.dataset.key;
-    const keys = getDismissedKeys();
-    keys.add(key);
-    saveDismissedKeys(keys);
-    renderDuplicates();
+    showDismissModal(async rationale => {
+      state.dismissedKeys.set(key, { group_type: 'object', rationale });
+      renderDuplicates();
+      try { await API.dismissGroup(key, 'object', rationale); }
+      catch (e) { console.warn('Dismiss persist failed:', e); }
+    });
+    return;
+  }
+
+  const undismissBtn = e.target.closest('.undismiss-btn');
+  if (undismissBtn) {
+    const key = undismissBtn.dataset.key;
+    await performUndismiss(key);
+    return;
+  }
+
+  const schemaDismissBtn = e.target.closest('.schema-dismiss-btn');
+  if (schemaDismissBtn) {
+    const key = schemaDismissBtn.dataset.sgkey;
+    showDismissModal(async rationale => {
+      state.dismissedKeys.set(key, { group_type: 'schema', rationale });
+      renderDuplicates();
+      try { await API.dismissGroup(key, 'schema', rationale); }
+      catch (err) { console.warn('Schema dismiss persist failed:', err); }
+    });
+    return;
+  }
+
+  const schemaRestoreBtn = e.target.closest('.schema-undismiss-btn');
+  if (schemaRestoreBtn) {
+    performUndismiss(schemaRestoreBtn.dataset.sgkey);
     return;
   }
 
