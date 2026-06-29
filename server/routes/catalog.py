@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from server.scanner import scanner
+from server.comparator import compute_single_table_lineage_graph
 from server.cache import CacheManager
 
 logger = logging.getLogger(__name__)
@@ -11,6 +12,19 @@ router = APIRouter(prefix="/api/catalog", tags=["catalog"])
 
 # Shared cache manager instance
 cache_manager = CacheManager(scanner)
+
+
+
+
+@router.get("/health")
+def catalog_health():
+    """Diagnostic: confirm scanner state without triggering a scan."""
+    return {
+        "is_scanned":         scanner.is_scanned,
+        "scanned_catalogs":   len(scanner._scanned_catalogs),
+        "tables_loaded":      len(scanner._tables),
+        "upstream_map_keys":  len(scanner._upstream_map),
+    }
 
 
 @router.get("/list")
@@ -128,3 +142,27 @@ def get_table(catalog: str, schema: str, table: str):
     if result is None:
         raise HTTPException(status_code=404, detail=f"Table {catalog}.{schema}.{table} not found")
     return result
+
+
+
+@router.get("/table-lineage/{catalog}/{schema}/{table}")
+def table_lineage(catalog: str, schema: str, table: str, depth: int = Query(3, ge=1, le=8)):
+    """Return upstream + downstream lineage for a single table as a dagre graph.
+
+    Always queries table_lineage live (not the cached in-memory maps) so
+    results are fresh regardless of when the last scan ran.
+    """
+    if not scanner.is_scanned:
+        raise HTTPException(status_code=400, detail="No scan has been run yet")
+
+    full_name = f"{catalog}.{schema}.{table}".lower()
+
+    upstream_map, downstream_map = scanner.fetch_table_lineage_edges(full_name, depth=depth)
+
+    return compute_single_table_lineage_graph(
+        table_name=full_name,
+        upstream_map=upstream_map,
+        downstream_map=downstream_map,
+        consumer_counts=scanner._consumer_counts,
+        depth=depth,
+    )

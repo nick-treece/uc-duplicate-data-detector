@@ -479,3 +479,86 @@ def compute_lineage_graph(
         })
 
     return {"nodes": nodes, "edges": edges}
+
+
+def compute_single_table_lineage_graph(
+    table_name: str,
+    upstream_map: dict,
+    downstream_map: dict,
+    consumer_counts: dict,
+    depth: int = 3,
+    max_nodes: int = 150,
+) -> dict:
+    """BFS upstream and downstream from one table to build its lineage subgraph.
+
+    Returns the same {nodes, edges} format as compute_lineage_graph so the
+    same renderDagreGraph frontend component can render it unchanged.
+    """
+    from collections import deque
+
+    focal = table_name.lower()
+
+    def bfs(start: str, neighbour_fn, limit: int) -> dict[str, int]:
+        """BFS returning {node: hop_count} for all nodes within limit hops."""
+        visited = {start: 0}
+        queue = deque([(start, 0)])
+        while queue:
+            node, d = queue.popleft()
+            if d >= limit:
+                continue
+            for neighbour in neighbour_fn(node):
+                if neighbour not in visited:
+                    visited[neighbour] = d + 1
+                    queue.append((neighbour, d + 1))
+        return visited
+
+    upstream_nodes   = bfs(focal, lambda n: upstream_map.get(n, set()),   depth)
+    downstream_nodes = bfs(focal, lambda n: downstream_map.get(n, set()), depth)
+
+    all_nodes: dict[str, int] = {**upstream_nodes, **downstream_nodes}  # focal present in both at depth 0
+
+    # Cap node count — keep closest nodes to the focal table
+    if len(all_nodes) > max_nodes:
+        all_nodes = dict(sorted(all_nodes.items(), key=lambda kv: kv[1])[:max_nodes])
+
+    # Build edges between visible nodes only
+    edges: set[tuple[str, str]] = set()
+    for node in all_nodes:
+        for parent in upstream_map.get(node, set()):
+            if parent in all_nodes:
+                edges.add((parent, node))
+        for child in downstream_map.get(node, set()):
+            if child in all_nodes:
+                edges.add((node, child))
+
+    # Shared helpers — same logic as compute_lineage_graph
+    def get_tier(node_name: str) -> str:
+        cat = node_name.split(".")[0].lower() if "." in node_name else node_name.lower()
+        if "gold"   in cat: return "gold"
+        if "silver" in cat: return "silver"
+        if "bronze" in cat: return "bronze"
+        if "copper" in cat: return "copper"
+        return "unknown"
+
+    def short_label(full_name: str) -> str:
+        parts = full_name.split(".")
+        return f"{parts[1]}.{parts[2]}" if len(parts) == 3 else full_name
+
+    nodes = [
+        {
+            "id":                 name,
+            "label":              short_label(name),
+            "tier":               get_tier(name),
+            "is_target":          name == focal,
+            "is_shared_ancestor": False,
+            "consumers":          consumer_counts.get(name, 0),
+            "depth_upstream":     upstream_nodes.get(name),
+            "depth_downstream":   downstream_nodes.get(name),
+        }
+        for name in sorted(all_nodes)
+    ]
+
+    return {
+        "nodes": nodes,
+        "edges": [{"source": s, "target": t} for s, t in edges],
+    }

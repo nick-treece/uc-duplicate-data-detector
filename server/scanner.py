@@ -1000,6 +1000,68 @@ class CatalogScanner:
     def load_table_permissions(self, catalog: str, table_obj: "TableInfo"):
         self._fetch_permissions(catalog, [table_obj])
 
+
+    def fetch_table_lineage_edges(self, full_name: str, depth: int = 3) -> tuple[dict, dict]:
+        """Live BFS against table_lineage for a single focal table.
+
+        Queries the live table_lineage view hop-by-hop rather than reading
+        the cached _upstream_map / _downstream_map, so results are always
+        fresh and not limited to what was loaded at scan time.
+
+        Returns (upstream_map, downstream_map) as plain dicts of sets
+        containing only nodes within `depth` hops of full_name.
+        """
+        from collections import defaultdict
+
+        src      = self._METADATA_SOURCE
+        focal    = full_name.lower()
+        visited  = {focal}
+        frontier = {focal}
+
+        upstream_map: dict  = defaultdict(set)
+        downstream_map: dict = defaultdict(set)
+
+        for _hop in range(depth):
+            if not frontier:
+                break
+
+            # SQL-safe single-quote escaping (matches rest of codebase)
+            in_list = ", ".join(
+                f"'{t.replace(chr(39), chr(39) * 2)}'" for t in frontier
+            )
+
+            rows = self._run_sql(
+                f"SELECT DISTINCT"
+                f"  lower(source_table_full_name) AS src,"
+                f"  lower(target_table_full_name) AS tgt"
+                f" FROM {src}.table_lineage"
+                f" WHERE event_date >= DATEADD(DAY, -90, CURRENT_DATE())"
+                f"   AND source_table_full_name IS NOT NULL"
+                f"   AND target_table_full_name IS NOT NULL"
+                f"   AND ("
+                f"       lower(source_table_full_name) IN ({in_list})"
+                f"       OR lower(target_table_full_name) IN ({in_list})"
+                f"   )",
+                quiet=True,
+            )
+
+            new_frontier: set = set()
+            if rows:
+                for row in rows:
+                    s, t = row[0], row[1]
+                    if not s or not t or s == t:
+                        continue
+                    upstream_map[t].add(s)
+                    downstream_map[s].add(t)
+                    for node in (s, t):
+                        if node not in visited:
+                            visited.add(node)
+                            new_frontier.add(node)
+
+            frontier = new_frontier
+
+        return dict(upstream_map), dict(downstream_map)
+
     def load_from_cache(self, scan_result: dict):
         """Restore scanner state from cache + bulk metadata queries."""
         self._update_status(state="running", message="Loading tables\u2026")
